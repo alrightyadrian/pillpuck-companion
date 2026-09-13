@@ -11,6 +11,10 @@
 <link rel="apple-touch-icon" href="icon-192.png">
 <!--
   PillPuck Companion — v0.7 protocol (Sep 9 2026). Talks to firmware 18_pillpuck_v07 (and v0.6.1)
+  App build 2 (Sep 13 2026): log-pull integrity after A10 finding 1 on the study puck (one 20-byte notify
+  piece lost in a 1361-byte dump). Exact byte-count check, both file lines required, up to 3 pulls, only a
+  complete pull is shown as events or cached, mid-dump stall handling, refusals end the pull at once.
+  Also remembers the puck: getDevices + watchAdvertisements reconnect on open with no chooser (feature-detected).
   over the Nordic UART Service text-command channel. Web Bluetooth: Chrome / Edge on desktop and
   Android. iPhone Safari does not support Web Bluetooth.
   There is NO dismiss control in this app and no command in the protocol that could be one.
@@ -134,7 +138,7 @@
 <div class="wrap">
   <header>
     <div class="wordmark">Pill<span>Puck</span></div>
-    <div class="tag">companion · v0.7 protocol</div>
+    <div class="tag">companion · v0.7 protocol · app build 2 (Sep 13)</div>
   </header>
 
   <div class="puckzone">
@@ -232,6 +236,8 @@
       <div class="btnrow" style="margin-top:8px">
         <input type="text" id="raw-cmd" placeholder="raw command, e.g. S" class="mono">
         <button id="btn-raw" class="small" disabled>Send</button>
+        <button id="btn-other" class="small ghost" title="Open the chooser to pick a different puck (the remembered one is kept)">Find another puck</button>
+        <button id="btn-forget" class="small ghost" title="Drop the remembered puck so Find my puck shows the chooser again">Forget puck</button>
       </div>
       <div id="console" class="mono" style="margin-top:8px"></div>
     </details>
@@ -343,15 +349,25 @@ const PP = {
   hm(h,m){ let ap=h>=12?'PM':'AM', hh=h%12||12; return hh+':'+String(m).padStart(2,'0')+' '+ap; },
   // dump integrity (QA 6): compare announced byte counts with what arrived
   checkDump(lines){
-    let announced=0, got=0, inFile=false;
+    let announced=0, got=0, inFile=false, sawOld=false, sawTxt=false, raw=false, sawAny=false;
     for(const l of lines){
-      let m=/^---- \/log\.(txt|old) \((\d+) bytes\) ----$/.exec(l);
-      if(m){ announced+=+m[2]; inFile=true; continue; }
-      if(/^\/log\.(txt|old): empty$/.test(l)){ inFile=false; continue; }
-      if(/---- end of log ----/.test(l)){ inFile=false; continue; }
+      if(/\/log\.(txt|old)/.test(l) || /RAW FLASH SCAN/.test(l)) sawAny=true;   // loose: a dump happened, even if its header got fused
+      // The puck sends each header's newline as a separate 1-byte notification, so two header lines can arrive
+      // fused ("/log.old: empty---- /log.txt (N bytes) ----"). The records after it are intact, so match the
+      // header lines anywhere in the line. A header fused to a RECORD is still caught: that record is not counted.
+      let hit=false, lastPos=-1, lastIsFile=false;
+      for(const m of l.matchAll(/---- \/log\.(txt|old) \((\d+) bytes\) ----/g)){ announced+=+m[2]; if(m[1]==='old') sawOld=true; else sawTxt=true; hit=true; if(m.index>lastPos){ lastPos=m.index; lastIsFile=true; } }
+      for(const m of l.matchAll(/\/log\.(txt|old): empty/g)){ if(m[1]==='old') sawOld=true; else sawTxt=true; hit=true; if(m.index>lastPos){ lastPos=m.index; lastIsFile=false; } }
+      if(hit){ inFile=lastIsFile; continue; }     // a record fused onto this header line is simply not counted (loss stays visible)
+      if(/^---- RAW FLASH SCAN/.test(l)){ raw=true; inFile=false; continue; }   // v0.7.1 change 20: recorder not mounted, no byte count exists
+      if(/---- end of log ----/.test(l) || /^---- raw scan: \d+ text runs ----/.test(l)){ inFile=false; continue; }
       if(inFile) got += l.length+1;
     }
-    return { announced, got, complete: got>=announced };
+    // A10 finding 1 (Sep 13): BOTH file lines must be present and the byte count must match EXACTLY. The firmware
+    // writes every record as "%s\n", so short = loss, long = a fused or stale line. No file line at all = not a
+    // dump (a stray end marker left in the buffer).
+    const sawFile = sawOld && sawTxt;
+    return { announced, got, sawFile, sawAny, raw, complete: sawFile && got===announced };
   }
 };
 if(typeof module!=='undefined') module.exports = PP;   // node test hook
@@ -377,6 +393,12 @@ let logFresh = false;          // true once a dump has arrived on THIS connectio
 let cache = load('pp_cache', null);   // {id, rawLog, at} from a previous session — shown as history only
 let schedDraft = null; let schedDirty = false;
 let inLog=false, logBuf=[], logTimer=null, logBytes=0, logAnnounced=0;
+// A10 finding 1 (Sep 13, study puck, v0.6.1): one 20-byte notify piece was dropped in a 1361-byte dump
+// (1341 arrived). v0.6.1 ignores the return of bleuart.write(), and the core gives up after 100 ms when
+// its 3-deep notify queue is full. The app cannot stop the puck dropping a piece; it can refuse to trust a
+// short pull. So: re-pull up to PULL_MAX times, keep only a byte-complete pull, and never cache a short one.
+const PULL_MAX=3;
+let pullAttempt=0, pullBest=null, rawLogOk=false, pulling=false, pullRefused=null, logSwallow=0;
 let statusTimer=null, statusWaitTimer=null;
 let liveAlarm=false;           // alarm state as last seen (events or status)
 let wdtToasted=false, lastSyncAt=0, lastDevice=null;
@@ -384,13 +406,20 @@ let wdtToasted=false, lastSyncAt=0, lastDevice=null;
 // ================= line dispatch =================
 function onLine(line){
   con('rx', line);
-  if(/---- end of log ----/.test(line)){ inLog=false; logBuf.push(line); clearTimeout(logTimer); finishLog(false); return; }   // QA 4: anywhere in the line
-  if(/^---- \/log\.(txt|old) \((\d+) bytes\) ----/.test(line) || /^\/log\.(txt|old): empty/.test(line)){
-    inLog=true; logBuf.push(line); const m=/\((\d+) bytes\)/.exec(line); if(m) logAnnounced+=+m[1]; armLogTimer(); showLogProgress(); return; }
-  if(inLog){ logBuf.push(line); logBytes+=line.length+1; armLogTimer(); showLogProgress(); return; }
-  if(/^locked - press the puck button/.test(line)){ showWindow(false); setDisc('locked','LOCKED','press the puck button'); toast('Puck is locked. Press its button once to open a 5-minute window.'); return; }
+  const isHeader = /^---- \/log\.(txt|old) \((\d+) bytes\) ----/.test(line) || /^\/log\.(txt|old): empty/.test(line) || /^---- RAW FLASH SCAN/.test(line);
+  const isEnd = /---- end of log ----/.test(line) || /^---- raw scan: \d+ text runs ----/.test(line);   // v0.7.1 raw scan has no end-of-log marker
+  // After a mid-dump stall the rest of that dump is NOT live traffic. Only dump-shaped lines (EVENT records and
+  // the end marker) are swallowed, time-boxed, until the next header; status, replies and refusals pass (QA 3/8).
+  if(logSwallow && Date.now()<logSwallow && !isHeader && (isEnd || /^EVENT /.test(line))){ if(isEnd) logSwallow=0; return; }
+  if(isHeader) logSwallow=0;
+  if(isEnd && !inLog && !pulling) return;                       // stray end marker outside any pull: ignore it
+  if(isEnd){ inLog=false; logBuf.push(line); clearTimeout(logTimer); finishLog(false); return; }   // QA 4: anywhere in the line
+  if(isHeader){ inLog=true; logBuf.push(line); const m=/\((\d+) bytes\)/.exec(line); if(m) logAnnounced+=+m[1]; armLogTimer(STALL_MS); showLogProgress(); return; }
+  if(inLog){ logBuf.push(line); logBytes+=line.length+1; armLogTimer(STALL_MS); showLogProgress(); return; }
+  if(/^locked - press the puck button/.test(line)){ showWindow(false); setDisc('locked','LOCKED','press the puck button'); toast('Puck is locked. Press its button once to open a 5-minute window.'); if(pulling){ pullRefused='locked'; finishLog(true); } return; }
+  if(/^\? alarm is ringing/.test(line) && pulling){ pullRefused='alarm'; finishLog(true); toast('The puck will not dump its log while an alarm is ringing.'); return; }
   if(/^BLE window open 5 min/.test(line)){ showWindow(true); toast('Window open for 5 minutes'); send('S'); return; }
-  if(/^log cleared/.test(line)){ rawLog=''; events=[]; logFresh=true; cache=null; try{ localStorage.removeItem('pp_cache'); }catch(e){} renderAll(); toast('Log cleared on the puck'); return; }
+  if(/^log cleared/.test(line)){ rawLog=''; rawLogOk=false; events=[]; logFresh=true; cache=null; try{ localStorage.removeItem('pp_cache'); }catch(e){} renderAll(); toast('Log cleared on the puck'); return; }
   if(/^R cancels TEST alarms only/.test(line)){ toast('R only cancels TEST alarms. A real alarm ends at the bottle.'); return; }
   if(PP.parseStatusLine(line, status)){ clearTimeout(statusWaitTimer); statusWaitTimer=null; clearTimeout(statusTimer); statusTimer=setTimeout(()=>{ statusAt=Date.now(); renderStatus(); }, 250); return; }
   const ev = PP.parseEvent(line);
@@ -398,7 +427,11 @@ function onLine(line){
   if(/^\? /.test(line) || /^! /.test(line) || /^!! /.test(line)) toast(line.replace(/^[!?]+\s*/,''));
   else if(/^E unix=dated sync/.test(line)) toast('Puck help: '+line);
 }
-function armLogTimer(){ clearTimeout(logTimer); logTimer=setTimeout(()=>{ if(inLog){ inLog=false; finishLog(true); } }, 4000); }
+// Two timers (QA 3): REPLY_MS = no reply at all after L (locked puck, link gone). STALL_MS = gap between two
+// dump lines once the dump has started; v0.7.x gives each notify piece up to ~2.2 s of retries and a line can
+// be 4 pieces at MTU 23, so 4 s was too short. On a mid-dump stall the rest of that dump is swallowed.
+const REPLY_MS=4000, STALL_MS=12000;
+function armLogTimer(ms){ clearTimeout(logTimer); logTimer=setTimeout(()=>{ if(inLog || pulling){ const mid=inLog; inLog=false; finishLog(true, mid); } }, ms); }
 function showLogProgress(){ const p=$('log-progress'); p.hidden=false; p.textContent='pulling… '+logBytes+(logAnnounced?' of '+logAnnounced:'')+' bytes'; }
 function liveEvent(ev){
   if(ev.day!==null || EPOCH_MARKERS.has(ev.type)){ events.push(ev); }
@@ -413,17 +446,48 @@ function liveEvent(ev){
   if(ev.type==='IMU_SKIPPED') toast('Puck skipped its motion sensor after a hung boot. Power-cycle to retry.');
   renderAll();
 }
-function finishLog(truncated){
-  const lines=logBuf.slice(); logBuf=[]; $('log-progress').hidden=true;
+function finishLog(truncated, midDump){
+  const lines=logBuf.slice(); logBuf=[]; clearTimeout(logTimer); $('log-progress').hidden=true; logBytes=0; logAnnounced=0;
   const chk=PP.checkDump(lines);
-  rawLog = lines.join('\n'); events = lines.map(PP.parseEvent).filter(Boolean); logFresh=true;
-  logBytes=0; logAnnounced=0;
+  const refused=pullRefused; pullRefused=null;
+  const nothing = !chk.sawAny;                                   // no dump: locked puck, alarm ringing, link gone, or a stray end marker
+  const complete = !nothing && (chk.raw || (!truncated && chk.complete));
+  // a stall with records still owed: the rest of that dump may trickle in; swallow EVENT lines for a while (QA 3)
+  if(truncated && midDump && !chk.raw && chk.got<chk.announced) logSwallow=Date.now()+STALL_MS;
+  const cause = refused ? refused : nothing ? 'no dump' : chk.raw ? 'raw scan' : truncated ? 'stalled after '+chk.got+' of '+chk.announced+' bytes' : !chk.sawFile ? 'a file header line was lost' : chk.got<chk.announced ? (chk.announced-chk.got)+' bytes lost ('+chk.got+' of '+chk.announced+')' : chk.got>chk.announced ? 'extra bytes ('+chk.got+' of '+chk.announced+')' : 'end marker missing';
+  if(!pullBest || complete || (!nothing && chk.got>pullBest.chk.got)) pullBest={lines,chk,truncated,complete,cause};
+  if(!complete && !nothing && !refused && pullAttempt<PULL_MAX && link && !link.sim){
+    con('sys','pull '+pullAttempt+' of '+PULL_MAX+': '+cause+' - pulling again');
+    toast('Pull '+pullAttempt+': '+cause+'. Pulling again, '+(pullAttempt+1)+' of '+PULL_MAX+'…');
+    const l=link; setTimeout(()=>{ if(link===l && !inLog) pullOnce(); }, 800);   // stays 'pulling' across the gap (QA 4)
+    return;
+  }
+  pulling=false;
+  const best=pullBest; pullBest=null;
   const w=$('log-warn');
-  if(truncated || !chk.complete){ w.hidden=false; w.textContent='Log looks incomplete ('+chk.got+' of '+chk.announced+' bytes arrived'+(truncated?', dump stalled':'')+'). Pull again before trusting it.'; }
+  const refusedNote = refused==='locked' ? 'The puck is now locked: press its button once before pulling again. ' : refused==='alarm' ? 'The puck is now ringing: deal with the dose at the bottle first. ' : '';
+  if(nothing && !best.chk.sawAny){
+    w.hidden=false; w.textContent= refused==='locked' ? 'The puck is locked. Press its button once, then pull again.' :
+      refused==='alarm' ? 'The puck is ringing. It will not dump its log until the dose is dealt with at the bottle.' :
+      'No dump arrived from the puck.';
+    updateButtons(); return;
+  }
+  if(!best.complete && rawLogOk){
+    // keep the complete pull already on screen rather than replace it with a short one
+    w.hidden=false; w.textContent=refusedNote+'This pull failed ('+best.cause+', '+pullAttempt+' tries). Kept the earlier complete pull. Pull again, or use nRF Connect.';
+    toast('Failed pull discarded, earlier complete pull kept'); updateButtons(); return;
+  }
+  rawLog = best.lines.join('\n'); rawLogOk=best.complete && !best.chk.raw;
+  // QA 5 / QA2 1: a short dump can fuse two records into one line that still parses into plausible wrong values,
+  // so an incomplete pull (or a raw scan) is NEVER turned into events, cards or the week strip, and it does not
+  // count as "the log has been read" (logFresh) - live events witnessed on this connection stay as they are.
+  if(rawLogOk){ events = best.lines.map(PP.parseEvent).filter(Boolean); logFresh=true; }
+  if(best.chk.raw){ w.hidden=false; w.textContent='The puck\'s recorder would not mount, so this is a raw flash scan, not a log. Save the raw text for the bench.'; }
+  else if(!best.complete){ w.hidden=false; w.textContent=refusedNote+'Log pull failed ('+best.cause+' after '+pullAttempt+' tries). Nothing from this pull is shown as fact. Do not archive it. Pull again, or use nRF Connect.'; }
   else w.hidden=true;
-  if(link && !link.sim) { cache={ id:link.id, rawLog, at:Date.now() }; store('pp_cache', cache); }
-  renderAll(); toast('Log pulled: '+events.length+' events'+(chk.complete?'':' (incomplete)'));
-  $('btn-log-copy').disabled = !rawLog; $('btn-log').disabled=!link;
+  if(rawLogOk && link && !link.sim) { cache={ id:link.id, rawLog, at:Date.now() }; store('pp_cache', cache); }   // only a complete pull is ever cached
+  renderAll(); toast(best.chk.raw ? 'Raw flash scan saved ('+best.lines.length+' lines)' : best.complete ? ('Log pulled: '+events.length+' events'+(pullAttempt>1?' (complete on try '+pullAttempt+')':'')) : 'Log pull FAILED ('+best.cause+')');
+  $('btn-log-copy').disabled = !rawLog;
 }
 
 // ================= rendering =================
@@ -534,6 +598,7 @@ function renderAll(){ renderLast(); renderWeek(); renderTables(); updateButtons(
 function updateButtons(){
   const on=!!link;
   for(const id of ['btn-sync','btn-status','btn-log','btn-note','btn-x','btn-raw','btn-sched-all']) $(id).disabled=!on;
+  $('btn-log').disabled = !on || pulling || inLog;   // QA 4: a status render used to re-enable it mid-pull
   document.querySelectorAll('.note-q').forEach(b=>b.disabled=!on);
   $('btn-log-copy').disabled=!rawLog;
   $('btn-sched-save').disabled = !(on && schedDirty && schedDraft && schedDraft.every(PP.hmOk));
@@ -571,6 +636,45 @@ async function saveSchedule(){
   await send('S');
 }
 
+// ================= remembered puck (build 2) =================
+// Chrome keeps the permission for a puck you have paired once with this page. On the next open the app asks
+// Chrome for that device (getDevices), waits to hear it advertise (watchAdvertisements), then connects with
+// no chooser. Both calls are feature-detected: a browser without them falls back to "Find my puck".
+let remembered=null;
+async function findRemembered(){
+  if(!navigator.bluetooth || !navigator.bluetooth.getDevices) return null;
+  let devs=[]; try{ devs=await navigator.bluetooth.getDevices(); }catch(e){ con('sys','getDevices: '+e.message); return null; }
+  const saved=load('pp_device', null);
+  let d = saved ? devs.find(x=>x.id===saved.id) : null;
+  if(!d && !load('pp_forgot',null)){ const pucks=devs.filter(x=>/^PillPuck/.test(x.name||'')); if(pucks.length===1) d=pucks[0]; }   // never after a Forget
+  return d||null;
+}
+// Resolve true once the device has been heard advertising (or the browser cannot watch), false on timeout.
+function wakeDevice(device, ms){
+  return new Promise(res=>{
+    if(!device.watchAdvertisements){ res(true); return; }
+    const ac=new AbortController(); let done=false;
+    const onAd=()=>finish(true);
+    const finish=(ok)=>{ if(done) return; done=true; try{ ac.abort(); }catch(e){} try{ device.removeEventListener('advertisementreceived', onAd); }catch(e){} res(ok); };
+    device.addEventListener('advertisementreceived', onAd);
+    try{ device.watchAdvertisements({signal:ac.signal}).catch(e=>{ con('sys','watchAdvertisements: '+e.message); finish(true); }); }
+    catch(e){ con('sys','watchAdvertisements: '+e.message); finish(true); return; }
+    setTimeout(()=>finish(false), ms);
+  });
+}
+async function reconnectRemembered(auto){
+  const d = remembered || lastDevice || await findRemembered();
+  if(!d){ if(!auto) toast('No remembered puck. Tap Find my puck.'); return false; }
+  remembered=d; lastDevice=d;
+  setDisc('conn','LOOKING', d.name||'PillPuck'); $('btn-ble').textContent='Looking…'; $('btn-ble').disabled=true;
+  const heard = await wakeDevice(d, auto?8000:15000);
+  $('btn-ble').disabled=false;
+  if(link){ return false; }                                   // the user connected something else (demo) while we were listening
+  if(!heard){ setDisc('idle','NO PUCK', auto?'not heard in 8 s':'not heard in 15 s'); $('btn-ble').textContent='Reconnect'; if(!auto) toast('Did not hear the puck in 15 s. Is Bluetooth on, and is the puck within a few feet?'); else con('sys','remembered puck not heard within 8 s'); return false; }
+  await connectBle(d);
+  return !!link;
+}
+
 // ================= real BLE link =================
 async function connectBle(device){
   if(!navigator.bluetooth){ toast('This browser has no Web Bluetooth. Use Chrome or Edge on desktop or Android.'); return; }
@@ -579,7 +683,7 @@ async function connectBle(device){
     catch(e){ con('sys','chooser: '+e.message); return; }
   }
   setDisc('conn','CONNECTING', device.name||'');
-  inLog=false; logBuf=[]; logBytes=0; logAnnounced=0; status={}; logFresh=false; events=[]; rawLog=''; schedDirty=false; wdtToasted=false;   // QA 2/4
+  inLog=false; logBuf=[]; logBytes=0; logAnnounced=0; status={}; logFresh=false; events=[]; rawLog=''; rawLogOk=false; pullBest=null; pullAttempt=0; schedDirty=false; wdtToasted=false; $('log-warn').hidden=true;   // QA 2/4
   try{
     device.addEventListener('gattserverdisconnected', onDisconnected, {once:true});   // QA 19
     const server = await device.gatt.connect();
@@ -596,8 +700,9 @@ async function connectBle(device){
     link = { sim:false, device, id:device.id,
       // QA 5: write WITH response in <=20-byte pieces so an MTU-23 Android stack can never truncate a note
       send: async (line)=>{ const data=enc.encode(line+'\n'); for(let i=0;i<data.length;i+=20){ await rx.writeValue(data.slice(i,i+20)); } },
-      close: ()=>{ try{ device.gatt.disconnect(); }catch(e){} } };
-    lastDevice=device;
+      close: ()=>{ try{ device.gatt.disconnect(); }catch(e){} },
+      resetBuf: ()=>{ buf=''; } };   // A10-1: a lost trailing newline leaves half a line here; drop it before each L
+    lastDevice=device; store('pp_device', { id:device.id, name:device.name||'PillPuck', at:Date.now() }); try{ localStorage.removeItem('pp_forgot'); }catch(e){}   // remembered puck (build 2)
     $('btn-ble').textContent='Disconnect';
     updateButtons(); con('sys','connected to '+(device.name||'puck')+' — asking for status');
     if(cache && cache.id!==device.id){ cache=null; try{ localStorage.removeItem('pp_cache'); }catch(e){} }
@@ -613,10 +718,11 @@ async function connectBle(device){
       }
       if(!logFresh && status.window && status.window.open){ await pullLog(); }
     }, 1800);
-  }catch(e){ con('sys','connect failed: '+e.message); toast('Connect failed: '+e.message); setDisc('idle','NO PUCK','tap Find my puck'); try{ device.gatt.disconnect(); }catch(_){} link=null; updateButtons(); }
+  }catch(e){ con('sys','connect failed: '+e.message); toast('Connect failed: '+e.message); setDisc('idle','NO PUCK', lastDevice?'tap Reconnect':'tap Find my puck'); try{ device.gatt.disconnect(); }catch(_){} link=null; $('btn-ble').textContent = lastDevice?'Reconnect':'Find my puck'; $('btn-ble').disabled=false; updateButtons(); }
 }
-function onDisconnected(){ link=null; inLog=false; logBuf=[]; liveAlarm=false; updateButtons(); setDisc('idle','NO PUCK','disconnected'); $('btn-ble').textContent= lastDevice?'Reconnect':'Find my puck'; con('sys','disconnected'); renderLast(); }
-async function pullLog(){ if(inLog) { toast('Already pulling'); return; } logBuf=[]; inLog=false; logBytes=0; logAnnounced=0; $('log-warn').hidden=true; $('btn-log').disabled=true; await send('L'); armLogTimer(); }
+function onDisconnected(){ link=null; inLog=false; pulling=false; logSwallow=0; pullRefused=null; logBuf=[]; clearTimeout(logTimer); pullBest=null; $('log-progress').hidden=true; liveAlarm=false; updateButtons(); setDisc('idle','NO PUCK','disconnected'); $('btn-ble').textContent= lastDevice?'Reconnect':'Find my puck'; con('sys','disconnected'); renderLast(); }
+async function pullLog(){ if(inLog || pulling) { toast('Already pulling'); return; } pullAttempt=0; pullBest=null; await pullOnce(); }
+async function pullOnce(){ pullAttempt++; pulling=true; pullRefused=null; logBuf=[]; inLog=false; logBytes=0; logAnnounced=0; $('log-warn').hidden=true; $('btn-log').disabled=true; if(link && link.resetBuf) link.resetBuf(); const l=link; await send('L'); if(link!==l) return; armLogTimer(REPLY_MS); }
 
 // ================= demo puck (simulator of the v0.7 text protocol) =================
 function makeSim(){
@@ -664,10 +770,20 @@ function makeSim(){
 // ================= wiring =================
 $('btn-ble').addEventListener('click', ()=>{
   if(link){ const wasSim=link.sim; link.close(); if(wasSim){ link=null; document.body.classList.remove('simming'); onDisconnected(); } return; }
-  if(lastDevice && !lastDevice.gatt.connected && $('btn-ble').textContent==='Reconnect'){ connectBle(lastDevice); return; }
+  if($('btn-ble').textContent==='Looking…') return;
+  if(lastDevice && !lastDevice.gatt.connected && $('btn-ble').textContent==='Reconnect'){ reconnectRemembered(false); return; }
   connectBle();
 });
-$('btn-sim').addEventListener('click', ()=>{ if(link) link.close(); lastDevice=null; link=makeSim(); document.body.classList.add('simming'); status={}; events=[]; rawLog=''; logFresh=false; schedDirty=false; updateButtons(); $('btn-ble').textContent='Disconnect'; setDisc('conn','DEMO','not a real puck'); con('sys','demo puck'); send('S'); });
+$('btn-forget').addEventListener('click', async ()=>{
+  const d = remembered || lastDevice;
+  if(link && !link.sim) link.close();                          // drop the live link first; onDisconnected follows
+  try{ localStorage.removeItem('pp_device'); localStorage.setItem('pp_forgot','1'); }catch(e){}
+  let revoked=false; if(d && d.forget){ try{ await d.forget(); revoked=true; }catch(e){ con('sys','forget: '+e.message); } }
+  remembered=null; lastDevice=null; if(!link) $('btn-ble').textContent='Find my puck';
+  toast(revoked ? 'Forgot the puck. Find my puck will show the chooser.' : 'Forgot the puck on this page. Find my puck will show the chooser.');
+});
+$('btn-other').addEventListener('click', ()=>{ if(link) link.close(); remembered=null; lastDevice=null; $('btn-ble').textContent='Find my puck'; connectBle(); });   // chooser without revoking anything (two pucks)
+$('btn-sim').addEventListener('click', ()=>{ if(link) link.close(); lastDevice=null; link=makeSim(); document.body.classList.add('simming'); status={}; events=[]; rawLog=''; rawLogOk=false; pullBest=null; pullAttempt=0; logFresh=false; schedDirty=false; updateButtons(); $('btn-ble').textContent='Disconnect'; setDisc('conn','DEMO','not a real puck'); con('sys','demo puck'); send('S'); });
 $('disc').addEventListener('click', ()=>{ if(link&&link.sim){ if(liveAlarm) link.simTake(); else link.simButton(); setTimeout(()=>send('S'),400); } });
 $('btn-sync').addEventListener('click', ()=>syncClock(false));
 $('btn-status').addEventListener('click', ()=>send('S'));
@@ -678,13 +794,18 @@ document.querySelectorAll('.note-q').forEach(b=>b.addEventListener('click', ()=>
 $('btn-k').addEventListener('click', ()=>{ if(confirm('Mark today\'s dose as already handled? Only for a reboot inside the dose window when you already took it. This is logged as DOSE_MARKED_TAKEN, not DOSE_TAKEN.')) send('K'); });
 $('btn-x').addEventListener('click', ()=>send('X'));
 $('btn-r').addEventListener('click', ()=>send('R'));
-$('btn-raw').addEventListener('click', ()=>{ const c=$('raw-cmd').value.trim(); if(!c) return; if(/^[CF]\s+YES$/i.test(c) && !confirm(c.toUpperCase()+' erases the puck\'s record. Pull the log first. Continue?')) return; send(c); $('raw-cmd').value=''; });
+$('btn-raw').addEventListener('click', ()=>{ const c=$('raw-cmd').value.trim(); if(!c) return; if(/^L$/i.test(c)){ pullLog(); $('raw-cmd').value=''; return; } if(/^[CF]\s+YES$/i.test(c) && !confirm(c.toUpperCase()+' erases the puck\'s record. Pull the log first. Continue?')) return; send(c); $('raw-cmd').value=''; });
 $('raw-cmd').addEventListener('keydown', e=>{ if(e.key==='Enter') $('btn-raw').click(); });
 $('btn-sched-all').addEventListener('click', ()=>{ if(!schedDraft) schedDraft=Array(7).fill('09:00'); const t=schedDraft[0]; schedDraft=Array(7).fill(t); schedDirty=true; renderSlots(); $('sched-state').textContent='edited'; updateButtons(); });
 $('btn-sched-save').addEventListener('click', saveSchedule);
 
 renderSlots(); renderAll();
 if(!navigator.bluetooth) con('sys','No Web Bluetooth in this browser. The demo puck still works.');
+else (async ()=>{
+  remembered = await findRemembered();
+  if(remembered){ $('btn-ble').textContent='Reconnect'; con('sys','remembered puck: '+(remembered.name||remembered.id)+' - trying to reconnect'); await reconnectRemembered(true); }
+  else if(!navigator.bluetooth.getDevices) con('sys','this browser cannot remember pucks between visits (no getDevices); Find my puck each time');
+})();
 </script>
 <script>if("serviceWorker" in navigator){window.addEventListener("load",()=>{navigator.serviceWorker.register("sw.js").catch(()=>{});});}</script>
 </body>
