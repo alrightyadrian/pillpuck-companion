@@ -1,0 +1,691 @@
+<!doctype html>
+<html lang="en">
+<head>
+<title>PillPuck Companion</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#141c26">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<!--
+  PillPuck Companion — v0.7 protocol (Sep 9 2026). Talks to firmware 18_pillpuck_v07 (and v0.6.1)
+  over the Nordic UART Service text-command channel. Web Bluetooth: Chrome / Edge on desktop and
+  Android. iPhone Safari does not support Web Bluetooth.
+  There is NO dismiss control in this app and no command in the protocol that could be one.
+  R cancels TEST alarms only. Real alarms end at the bottle.
+-->
+<style>
+  :root{
+    --paper:#F7F6F2; --card:#FFFFFF; --ink:#1B1D20; --ink-soft:#5A5D63; --line:#E3E1DA;
+    --amber:#D97A00; --amber-soft:#FBEFDD; --good:#2E7D4F; --good-soft:#E4F1E9;
+    --bad:#C0392B; --bad-soft:#F9E7E4; --disc:#FFFFFF; --disc-lens:#2A2620;
+    --shadow:0 1px 2px rgba(27,29,32,.06), 0 8px 24px rgba(27,29,32,.07);
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --paper:#17181B; --card:#1F2125; --ink:#EDEBE6; --ink-soft:#9A9DA4; --line:#33363C;
+      --amber:#F0961E; --amber-soft:#33270F; --good:#4CAF7A; --good-soft:#16281E;
+      --bad:#E05B4A; --bad-soft:#331B17; --disc:#26282D; --disc-lens:#101113;
+      --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="dark"]{
+    --paper:#17181B; --card:#1F2125; --ink:#EDEBE6; --ink-soft:#9A9DA4; --line:#33363C;
+    --amber:#F0961E; --amber-soft:#33270F; --good:#4CAF7A; --good-soft:#16281E;
+    --bad:#E05B4A; --bad-soft:#331B17; --disc:#26282D; --disc-lens:#101113;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.35);
+  }
+  *{box-sizing:border-box}
+  body{margin:0; background:var(--paper); color:var(--ink);
+    font-family:'Archivo', system-ui, -apple-system, "Segoe UI", sans-serif; -webkit-font-smoothing:antialiased; line-height:1.45}
+  .wrap{max-width:460px; margin:0 auto; padding:20px 16px 48px; display:flex; flex-direction:column; gap:14px}
+  header{display:flex; align-items:baseline; justify-content:space-between; padding:4px 2px 0}
+  .wordmark{font-weight:900; font-size:22px; letter-spacing:-.02em}
+  .wordmark span{color:var(--amber)}
+  .tag{font-family:ui-monospace,'Chivo Mono',Menlo,Consolas,monospace; font-size:10.5px; color:var(--ink-soft); letter-spacing:.08em; text-transform:uppercase}
+  .mono{font-family:ui-monospace,'Chivo Mono',Menlo,Consolas,monospace; font-variant-numeric:tabular-nums}
+
+  .puckzone{display:flex; flex-direction:column; align-items:center; gap:14px; padding:10px 0 2px}
+  .disc{width:190px; height:190px; border-radius:50%; background:var(--disc); border:6px solid var(--line); box-shadow:var(--shadow);
+    display:flex; align-items:center; justify-content:center; transition:border-color .3s ease; position:relative; user-select:none}
+  .disc .lens{width:140px; height:140px; border-radius:50%; background:var(--disc-lens); display:flex; flex-direction:column;
+    align-items:center; justify-content:center; gap:4px; color:#EDEBE6; text-align:center; padding:12px}
+  .lens .st-big{font-family:ui-monospace,monospace; font-weight:700; font-size:14px; letter-spacing:.05em}
+  .lens .st-sub{font-family:ui-monospace,monospace; font-size:10px; color:#9A9DA4; letter-spacing:.06em}
+  .disc[data-st="idle"]{border-color:var(--line)}
+  .disc[data-st="ok"]{border-color:var(--good)}
+  .disc[data-st="alarm"]{border-color:var(--bad); animation:throb 1s ease-in-out infinite}
+  .disc[data-st="conn"]{border-color:var(--amber)}
+  .disc[data-st="locked"]{border-color:var(--amber); border-style:dashed}
+  @keyframes throb{0%,100%{transform:scale(1)}50%{transform:scale(1.035)}}
+  @media (prefers-reduced-motion: reduce){ .disc[data-st="alarm"]{animation:none} }
+
+  .btnrow{display:flex; gap:10px; width:100%; flex-wrap:wrap}
+  button{font-family:inherit; font-weight:700; font-size:14.5px; border:none; border-radius:10px; padding:13px 16px; cursor:pointer;
+    background:var(--amber); color:#fff; flex:1; letter-spacing:.01em; min-width:120px}
+  button.ghost{background:var(--card); color:var(--ink); border:1.5px solid var(--line)}
+  button.danger{background:var(--card); color:var(--bad); border:1.5px solid var(--bad)}
+  button.small{font-size:12.5px; padding:9px 10px; min-width:0}
+  button:focus-visible{outline:3px solid var(--amber); outline-offset:2px}
+  button:disabled{opacity:.45; cursor:default}
+
+  .card{background:var(--card); border:1px solid var(--line); border-radius:14px; padding:16px; box-shadow:var(--shadow)}
+  .card h2{margin:0 0 10px; font-size:11px; font-weight:700; letter-spacing:.12em; text-transform:uppercase; color:var(--ink-soft)}
+  .card h2 .r{float:right; font-weight:500; letter-spacing:0; text-transform:none}
+  .hint{font-size:12px; color:var(--ink-soft); margin:6px 0 0}
+  .warn{background:var(--amber-soft); color:var(--amber); border-radius:10px; padding:10px 12px; font-size:13px; font-weight:600}
+  .warn.bad{background:var(--bad-soft); color:var(--bad)}
+  .warn.good{background:var(--good-soft); color:var(--good)}
+
+  #lastcard{text-align:center; padding:22px 16px}
+  #last-state{display:inline-block; font-family:ui-monospace,monospace; font-weight:700; font-size:11px; letter-spacing:.1em; padding:4px 12px; border-radius:99px; margin-bottom:8px}
+  #last-state.ok{background:var(--good-soft); color:var(--good)}
+  #last-state.due{background:var(--bad-soft); color:var(--bad)}
+  #last-state.na{background:var(--amber-soft); color:var(--amber)}
+  #last-big{font-weight:900; font-size:48px; letter-spacing:-.03em; line-height:1.05; font-variant-numeric:tabular-nums}
+  #last-sub{font-family:ui-monospace,monospace; font-size:12px; color:var(--ink-soft); margin-top:6px; letter-spacing:.04em}
+
+  .kv{display:grid; grid-template-columns:auto 1fr; gap:4px 14px; font-size:13.5px}
+  .kv b{font-family:ui-monospace,monospace; font-weight:500; color:var(--ink-soft); font-size:12px; letter-spacing:.04em}
+
+  .week{display:flex; justify-content:space-between; padding:2px 6px}
+  .day{display:flex; flex-direction:column; align-items:center; gap:6px}
+  .day b{font-family:ui-monospace,monospace; font-weight:500; font-size:10px; color:var(--ink-soft)}
+  .dot{width:26px; height:26px; border-radius:50%; border:2px solid var(--line); display:flex; align-items:center; justify-content:center; font-size:13px}
+  .dot.t{background:var(--good); border-color:var(--good); color:#fff}
+  .dot.m{background:var(--bad-soft); border-color:var(--bad); color:var(--bad)}
+  .dot.r{background:var(--amber-soft); border-color:var(--amber); color:var(--amber)}
+  .dot.today{outline:2.5px solid var(--amber); outline-offset:2px}
+
+  .slot{display:flex; align-items:center; gap:10px; padding:8px 0; border-top:1px solid var(--line)}
+  .slot:first-of-type{border-top:none}
+  .slot .dn{font-family:ui-monospace,monospace; font-size:12px; width:38px; color:var(--ink-soft)}
+  .slot input[type=time]{font-family:ui-monospace,monospace; font-size:15px; font-weight:700; color:var(--ink);
+    background:var(--paper); border:1.5px solid var(--line); border-radius:8px; padding:7px 8px; flex:1}
+  .slot input[type=time].dirty{border-color:var(--amber)}
+
+  table{width:100%; border-collapse:collapse; font-size:13px}
+  th{font-family:ui-monospace,monospace; font-weight:500; font-size:10.5px; letter-spacing:.06em; text-transform:uppercase; color:var(--ink-soft); text-align:left; padding:6px 4px; border-bottom:1px solid var(--line)}
+  td{padding:7px 4px; border-bottom:1px solid var(--line); vertical-align:top}
+  .badge{font-family:ui-monospace,monospace; font-size:10px; font-weight:700; letter-spacing:.06em; padding:2px 8px; border-radius:99px; white-space:nowrap}
+  .b-t{background:var(--good-soft); color:var(--good)} .b-r{background:var(--bad-soft); color:var(--bad)}
+  .b-a{background:var(--amber-soft); color:var(--amber)} .b-i{background:var(--paper); color:var(--ink-soft)}
+  .tblwrap{overflow-x:auto}
+
+  textarea, input[type=text]{width:100%; font-family:ui-monospace,monospace; font-size:13px; color:var(--ink); background:var(--paper);
+    border:1.5px solid var(--line); border-radius:8px; padding:8px}
+  #console{height:180px; overflow:auto; white-space:pre-wrap; font-size:11.5px; line-height:1.5; background:var(--paper); border:1px solid var(--line); border-radius:8px; padding:8px}
+  #console .tx{color:var(--amber)} #console .rx{color:var(--ink)} #console .sys{color:var(--ink-soft)}
+  details summary{cursor:pointer; font-size:11px; font-weight:700; letter-spacing:.12em; text-transform:uppercase; color:var(--ink-soft)}
+  details[open] summary{margin-bottom:10px}
+  footer{text-align:center; padding:14px 8px 0; display:flex; flex-direction:column; gap:8px}
+  .manifesto{font-weight:700; font-size:13.5px}
+  .fine{font-family:ui-monospace,monospace; font-size:10px; color:var(--ink-soft); line-height:1.7}
+  #toast{position:fixed; left:50%; bottom:24px; transform:translateX(-50%) translateY(80px); background:var(--ink); color:var(--paper);
+    font-weight:700; font-size:14px; padding:12px 20px; border-radius:12px; box-shadow:var(--shadow); transition:transform .25s ease; max-width:88vw; text-align:center; z-index:9}
+  #toast.show{transform:translateX(-50%) translateY(0)}
+  .simnote{font-family:ui-monospace,monospace; font-size:10px; color:var(--amber); letter-spacing:.08em; text-transform:uppercase; text-align:center; display:none}
+  body.simming .simnote{display:block}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="wordmark">Pill<span>Puck</span></div>
+    <div class="tag">companion · v0.7 protocol</div>
+  </header>
+
+  <div class="puckzone">
+    <div class="disc" id="disc" data-st="idle" aria-live="polite">
+      <div class="lens">
+        <div class="st-big" id="st-big">NO PUCK</div>
+        <div class="st-sub" id="st-sub">tap Find my puck</div>
+      </div>
+    </div>
+    <div class="btnrow">
+      <button id="btn-ble">Find my puck</button>
+      <button id="btn-sim" class="ghost">Demo puck</button>
+    </div>
+    <div class="simnote">demo puck · nothing here is real</div>
+    <div id="window-warn" class="warn" hidden></div>
+  </div>
+
+  <div class="card" id="lastcard">
+    <span id="last-state" class="na">WAITING FOR PUCK</span>
+    <div id="last-big">—:—</div>
+    <div id="last-sub">the bottle will remember for you</div>
+  </div>
+
+  <div class="card">
+    <h2>Puck <span class="r mono" id="hdr-clock"></span></h2>
+    <div class="kv" id="statuskv">
+      <b>clock</b><span id="s-clock">—</span>
+      <b>alarm</b><span id="s-alarm">—</span>
+      <b>sensor</b><span id="s-sensor">—</span>
+      <b>recorder</b><span id="s-rec">—</span>
+      <b>window</b><span id="s-win">—</span>
+      <b>drift</b><span id="s-drift">—</span>
+      <b>cell</b><span id="s-cell">—</span>
+      <b>last reset</b><span id="s-reset">—</span>
+    </div>
+    <div class="btnrow" style="margin-top:12px">
+      <button id="btn-sync" class="ghost" disabled>Sync clock</button>
+      <button id="btn-status" class="ghost" disabled>Refresh</button>
+    </div>
+    <p class="hint" id="sync-hint">Sync sends the phone's local time as <span class="mono">E &lt;unix local seconds&gt;</span>. The puck refuses a backward move while a dose is pending or ringing, on purpose.</p>
+  </div>
+
+  <div class="card">
+    <h2>This week</h2>
+    <div class="week" id="week"></div>
+    <p class="hint" id="week-hint">Pull the log to fill this in.</p>
+  </div>
+
+  <div class="card">
+    <h2>Dose schedule <span class="r" id="sched-state"></span></h2>
+    <div id="slots"></div>
+    <div class="btnrow" style="margin-top:10px">
+      <button id="btn-sched-all" class="ghost small">Same time every day</button>
+      <button id="btn-sched-save" class="small" disabled>Save to puck</button>
+    </div>
+    <p class="hint">Pick a time you are reliably in one place and can reach the bottle, inside the window your prescriber allows. The puck refuses schedule changes while a dose is pending or ringing.</p>
+  </div>
+
+  <div class="card">
+    <h2>Notes for the study</h2>
+    <div class="btnrow">
+      <button class="ghost small note-q" data-n="home, bottle on desk">Home</button>
+      <button class="ghost small note-q" data-n="out, bottle with me">Out, bottle with me</button>
+      <button class="ghost small note-q" data-n="out, bottle at home">Out, bottle at home</button>
+    </div>
+    <div class="btnrow" style="margin-top:8px">
+      <input type="text" id="note-text" maxlength="40" placeholder="custom note, up to 40 chars, no 'EVENT'">
+      <button id="btn-note" class="small" disabled>Log note</button>
+    </div>
+    <p class="hint">Writes <span class="mono">EVENT NOTE</span> into the puck's flight recorder. One per 10 s.</p>
+  </div>
+
+  <div class="card">
+    <h2>Flight recorder <span class="r mono" id="log-meta"></span></h2>
+    <div class="btnrow">
+      <button id="btn-log" class="ghost" disabled>Pull the log</button>
+      <button id="btn-log-copy" class="ghost" disabled>Copy raw</button>
+    </div>
+    <div id="log-progress" class="hint mono" hidden></div>
+    <div id="log-warn" class="warn bad" hidden></div>
+    <div class="tblwrap" style="margin-top:10px"><table id="dosetable" hidden>
+      <thead><tr><th>day</th><th>date</th><th>result</th><th>at</th><th>latency</th></tr></thead>
+      <tbody></tbody></table></div>
+    <details style="margin-top:10px"><summary>Every event</summary><div class="tblwrap"><table id="evtable"><thead><tr><th>day</th><th>time</th><th>event</th><th>detail</th></tr></thead><tbody></tbody></table></div></details>
+  </div>
+
+  <div class="card">
+    <details><summary>Bench &amp; setup</summary>
+      <div class="btnrow">
+        <button id="btn-k" class="ghost small" disabled>K · mark today handled</button>
+        <button id="btn-x" class="ghost small" disabled>X · test alarm</button>
+        <button id="btn-r" class="ghost small" disabled>R · cancel TEST alarm</button>
+      </div>
+      <p class="hint"><b>K</b> is for a reboot inside the dose window when you already took it. <b>X</b> starts a test alarm; end it by tilting the puck past 60° for 3 s, holding the button 30 s, or <b>R</b>. R does nothing to a real alarm. There is no way to end a real alarm from here.</p>
+      <div class="btnrow" style="margin-top:8px">
+        <input type="text" id="raw-cmd" placeholder="raw command, e.g. S" class="mono">
+        <button id="btn-raw" class="small" disabled>Send</button>
+      </div>
+      <div id="console" class="mono" style="margin-top:8px"></div>
+    </details>
+  </div>
+
+  <footer>
+    <div class="manifesto">Now just take your pills.</div>
+    <div class="fine">There is no dismiss button in this app, and no command in the protocol that could be one.<br>Web Bluetooth: Chrome or Edge on desktop and Android. Not iPhone Safari.</div>
+  </footer>
+</div>
+<div id="toast" role="status"></div>
+
+<script>
+"use strict";
+// ================= protocol constants (firmware 18_pillpuck_v07) =================
+const NUS_SVC = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const NUS_TX  = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';   // puck -> phone (notify)
+const NUS_RX  = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';   // phone -> puck (write)
+const DOW = ['SUN','MON','TUE','WED','THU','FRI','SAT'];
+const DOWS = ['S','M','T','W','T','F','S'];
+const EPOCH_MARKERS = new Set(['BOOT','BOOT_WDT','FORMAT']);   // the puck's day counter restarts after these
+
+// ================= pure parsers (also exercised by sim/companion_parsers_test.js) =================
+const PP = {
+  // "EVENT DOSE_TAKEN day=5 09:24 latency_s=1479" -> {type, day, hh, mm, latency, peak, text}
+  // "EVENT BOOT" / "EVENT BOOT_WDT" / "EVENT IMU_SKIPPED" / "EVENT FORMAT" -> {type, day:null}
+  parseEvent(line){
+    const t = line.trim();
+    let m = /^EVENT\s+([A-Z_0-9]+)\s+day=(-?\d+)\s+(\d{2}):(\d{2})(.*)$/.exec(t);
+    if(m){
+      const ev = { type:m[1], day:+m[2], hh:+m[3], mm:+m[4], latency:null, peak:null, text:'' };
+      const rest = (m[5]||'').trim();
+      if(ev.type==='NOTE'){ ev.text = rest; return ev; }          // QA 14: never mine fields out of free text
+      const lat = /latency_s=(\d+)/.exec(rest); if(lat) ev.latency = +lat[1];
+      const pk  = /peak_deg=(-?\d+)/.exec(rest); if(pk) ev.peak = +pk[1];
+      return ev;
+    }
+    m = /^EVENT\s+(BOOT|BOOT_WDT|IMU_SKIPPED|FORMAT)(?:\s+(reas=0x[0-9a-fA-F]+))?\s*$/.exec(t);   // QA3 finding 4: only the real bare types, only the reas suffix
+    if(m){ const ev={ type:m[1], day:null, hh:null, mm:null, latency:null, peak:null, text:'', reas:null };   // QA 15: boots are visible
+      const rr=/reas=0x([0-9a-fA-F]+)/.exec(m[2]||''); if(rr) ev.reas=parseInt(rr[1],16);                 // v0.7 Sep 10: BOOT carries the reset reason
+      return ev; }
+    return null;
+  },
+  // status block lines -> partial status object (merge as lines arrive)
+  parseStatusLine(line, st){
+    let m;
+    if((m=/^clock:\s+(\d{2}):(\d{2})\s+day\s+(-?\d+)\s+weekday\s+(\S+)/.exec(line))){
+      st.clockSet=true; st.hh=+m[1]; st.mm=+m[2]; st.day=+m[3]; st.dow=(m[4]==='UNKNOWN')?null:DOW.indexOf(m[4]); st.dowKnown=st.dow!==null&&st.dow>=0; return true; }
+    if(/^clock:\s+NOT SET/.test(line)){ st.clockSet=false; st.dowKnown=false; return true; }
+    if((m=/^dose:((?:\s+\d{2}:\d{2}){7})/.exec(line))){ st.dose=m[1].trim().split(/\s+/); return true; }
+    if((m=/^alarm:\s+(\S+)\s+sensor:\s+(\S+)\s+recorder:\s+(\S+)/.exec(line))){ st.alarm=m[1]; st.sensor=m[2]; st.recorder=m[3]; return true; }
+    if((m=/^resting pose:\s+(yes|not yet)\s+BLE:\s+(\S+)\s+\((.*)\)/.exec(line))){
+      st.rest=m[1]==='yes'; const w=m[3];
+      if(/until the clock is set/.test(w)) st.window={open:true, untilSync:true, left:null};
+      else if(/OPEN/.test(w)){ const s=/(\d+) s left/.exec(w); st.window={open:true, untilSync:false, left:s?+s[1]:null}; }
+      else st.window={open:false, untilSync:false, left:0};
+      st.complete=true; return true; }
+    if((m=/^cell:\s+(\d+)\.(\d+) V.*last reset:\s+(.+?)\s+\(0x([0-9a-fA-F]+)\)/.exec(line))){ st.cellV=+(m[1]+'.'+m[2]); st.resetName=m[3]; st.resetReas=parseInt(m[4],16); return true; }
+    if(/^note: last reset was the WATCHDOG/.test(line)){ st.wdt=true; return true; }
+    if(/^note: BLE FAILED/.test(line)){ st.bleFault=true; return true; }
+    if((m=/^---- PillPuck (\S+) status ----/.exec(line))){ st.version=m[1]; return true; }
+    return false;
+  },
+  // seconds since 1970 in the phone's LOCAL time (the puck's E format: sender applies the timezone)
+  unixLocalNow(now){ const d = now||new Date(); return Math.floor((d.getTime() - d.getTimezoneOffset()*60000)/1000); },
+  // puck internal day -> Date (midnight local) given today's internal day index and the moment that status was true
+  dayToDate(dayIdx, todayIdx, now){ const d=new Date(now||Date.now()); d.setHours(0,0,0,0); d.setDate(d.getDate()-(todayIdx-dayIdx)); return d; },
+  // Split a log into boot epochs (QA 1): the day counter restarts after BOOT/BOOT_WDT/FORMAT.
+  // Returns {current: events of the last epoch, history: earlier events, epochs: count}
+  splitEpochs(events){
+    let last=0, epochs=1, sawDated=false;
+    events.forEach((e,i)=>{
+      if(e.day===null && EPOCH_MARKERS.has(e.type)){ if(sawDated) epochs++; last=i+1; sawDated=false; }
+      else if(e.day!==null) sawDated=true;
+    });
+    return { current: events.slice(last), history: events.slice(0,last), epochs };
+  },
+  // one row per scheduled day from an event list (dose-shaped events only)
+  summarizeDays(events){
+    const DOSE_TYPES = new Set(['ALARM_START','DOSE_TAKEN','REFUSED_30S','DOSE_MISSED','DOSE_UNKNOWN','DOSE_GAP_SKIP','DOSE_MARKED_TAKEN','OPEN_PARTIAL','NOTE']);
+    const days = new Map();
+    for(const e of events){
+      if(e.day===null || e.day<0 || !DOSE_TYPES.has(e.type)) continue;
+      const row = days.get(e.day) || {day:e.day, start:null, result:null, at:null, latency:null, notes:[], partials:0};
+      switch(e.type){
+        case 'ALARM_START': row.start={hh:e.hh,mm:e.mm}; if(!row.result) row.result='RINGING'; break;
+        case 'DOSE_TAKEN': row.result='TAKEN'; row.at={hh:e.hh,mm:e.mm}; row.latency=e.latency; break;
+        case 'REFUSED_30S': row.result='REFUSED'; row.at={hh:e.hh,mm:e.mm}; break;
+        case 'DOSE_MISSED': row.result='MISSED'; row.at={hh:e.hh,mm:e.mm}; break;
+        case 'DOSE_UNKNOWN': row.result='UNKNOWN'; row.at={hh:e.hh,mm:e.mm}; break;   // v0.7 Sep 10: the puck was not watching that window
+        case 'DOSE_GAP_SKIP': row.result='GAP SKIP'; row.at={hh:e.hh,mm:e.mm}; break;
+        case 'DOSE_MARKED_TAKEN': row.result='MARKED (K)'; row.at={hh:e.hh,mm:e.mm}; break;
+        case 'OPEN_PARTIAL': row.partials++; break;
+        case 'NOTE': row.notes.push(e.text); break;
+      }
+      days.set(e.day,row);
+    }
+    return [...days.values()].sort((a,b)=>a.day-b.day);
+  },
+  clockDriftSec(st, now){   // puck clock minus phone clock, seconds (positive = puck fast); minute resolution
+    if(!st||!st.clockSet) return null; const d=now||new Date();
+    const puck = st.hh*3600+st.mm*60; const phone = d.getHours()*3600+d.getMinutes()*60+d.getSeconds();
+    let diff = puck-phone; if(diff>43200) diff-=86400; if(diff<-43200) diff+=86400; return diff;
+  },
+  // nRF52840 POWER.RESETREAS: 0 = power-on / brown-out (the only resets that clear it)
+  resetReasonName(r){ if(r===0) return 'power lost or brown-out'; if(r&2) return 'watchdog'; if(r&1) return 'reset pin'; if(r&4) return 'soft reset'; if(r&8) return 'cpu lockup'; if(r&0x10000) return 'wake from off'; return 'other'; },
+  noteOk(t){ const s=(t||'').trim(); return s.length>0 && s.length<=40 && !/event/i.test(s) && /^[\x20-\x7E]+$/.test(s); },
+  hmOk(t){ return /^([01]\d|2[0-3]):[0-5]\d$/.test(t||''); },
+  hm(h,m){ let ap=h>=12?'PM':'AM', hh=h%12||12; return hh+':'+String(m).padStart(2,'0')+' '+ap; },
+  // dump integrity (QA 6): compare announced byte counts with what arrived
+  checkDump(lines){
+    let announced=0, got=0, inFile=false;
+    for(const l of lines){
+      let m=/^---- \/log\.(txt|old) \((\d+) bytes\) ----$/.exec(l);
+      if(m){ announced+=+m[2]; inFile=true; continue; }
+      if(/^\/log\.(txt|old): empty$/.test(l)){ inFile=false; continue; }
+      if(/---- end of log ----/.test(l)){ inFile=false; continue; }
+      if(inFile) got += l.length+1;
+    }
+    return { announced, got, complete: got>=announced };
+  }
+};
+if(typeof module!=='undefined') module.exports = PP;   // node test hook
+
+// ================= UI helpers =================
+const $ = id => document.getElementById(id);
+const toastEl = $('toast'); let toastT;
+function toast(msg){ toastEl.textContent = msg; toastEl.classList.add('show'); clearTimeout(toastT); toastT = setTimeout(()=>toastEl.classList.remove('show'), 3200); }
+function store(k,v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} }
+function load(k,fb){ try{ const v=localStorage.getItem(k); return v?JSON.parse(v):fb; }catch(e){ return fb; } }
+function con(kind, text){ const c=$('console'); const el=document.createElement('div'); el.className=kind; el.textContent=(kind==='tx'?'> ':kind==='rx'?'< ':'· ')+text; c.appendChild(el); c.scrollTop=c.scrollHeight; while(c.children.length>400) c.removeChild(c.firstChild); }
+function setDisc(st, big, sub){ $('disc').dataset.st = st; $('st-big').textContent = big; $('st-sub').textContent = sub; }
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+const h = escapeHtml;
+
+// ================= app state =================
+let link = null;               // {send(line), close(), sim:boolean, id}
+let status = {};               // parsed status of THIS connection
+let statusAt = 0;              // Date.now() when the last complete status arrived
+let rawLog = '';               // raw text of the last L dump (this session)
+let events = [];               // parsed events of the last L dump (this session)
+let logFresh = false;          // true once a dump has arrived on THIS connection
+let cache = load('pp_cache', null);   // {id, rawLog, at} from a previous session — shown as history only
+let schedDraft = null; let schedDirty = false;
+let inLog=false, logBuf=[], logTimer=null, logBytes=0, logAnnounced=0;
+let statusTimer=null, statusWaitTimer=null;
+let liveAlarm=false;           // alarm state as last seen (events or status)
+let wdtToasted=false, lastSyncAt=0, lastDevice=null;
+
+// ================= line dispatch =================
+function onLine(line){
+  con('rx', line);
+  if(/---- end of log ----/.test(line)){ inLog=false; logBuf.push(line); clearTimeout(logTimer); finishLog(false); return; }   // QA 4: anywhere in the line
+  if(/^---- \/log\.(txt|old) \((\d+) bytes\) ----/.test(line) || /^\/log\.(txt|old): empty/.test(line)){
+    inLog=true; logBuf.push(line); const m=/\((\d+) bytes\)/.exec(line); if(m) logAnnounced+=+m[1]; armLogTimer(); showLogProgress(); return; }
+  if(inLog){ logBuf.push(line); logBytes+=line.length+1; armLogTimer(); showLogProgress(); return; }
+  if(/^locked - press the puck button/.test(line)){ showWindow(false); setDisc('locked','LOCKED','press the puck button'); toast('Puck is locked. Press its button once to open a 5-minute window.'); return; }
+  if(/^BLE window open 5 min/.test(line)){ showWindow(true); toast('Window open for 5 minutes'); send('S'); return; }
+  if(/^log cleared/.test(line)){ rawLog=''; events=[]; logFresh=true; cache=null; try{ localStorage.removeItem('pp_cache'); }catch(e){} renderAll(); toast('Log cleared on the puck'); return; }
+  if(/^R cancels TEST alarms only/.test(line)){ toast('R only cancels TEST alarms. A real alarm ends at the bottle.'); return; }
+  if(PP.parseStatusLine(line, status)){ clearTimeout(statusWaitTimer); statusWaitTimer=null; clearTimeout(statusTimer); statusTimer=setTimeout(()=>{ statusAt=Date.now(); renderStatus(); }, 250); return; }
+  const ev = PP.parseEvent(line);
+  if(ev){ liveEvent(ev); return; }
+  if(/^\? /.test(line) || /^! /.test(line) || /^!! /.test(line)) toast(line.replace(/^[!?]+\s*/,''));
+  else if(/^E unix=dated sync/.test(line)) toast('Puck help: '+line);
+}
+function armLogTimer(){ clearTimeout(logTimer); logTimer=setTimeout(()=>{ if(inLog){ inLog=false; finishLog(true); } }, 4000); }
+function showLogProgress(){ const p=$('log-progress'); p.hidden=false; p.textContent='pulling… '+logBytes+(logAnnounced?' of '+logAnnounced:'')+' bytes'; }
+function liveEvent(ev){
+  if(ev.day!==null || EPOCH_MARKERS.has(ev.type)){ events.push(ev); }
+  if(ev.type==='ALARM_START'){ liveAlarm=true; status.alarm='ACTIVE'; setDisc('alarm','ALARM','open the bottle'); }
+  if(ev.type==='TEST_ALARM'){ liveAlarm=true; status.alarm='TEST'; setDisc('alarm','TEST ALARM','tilt, hold, or R'); }
+  if(ev.type==='DOSE_TAKEN'||ev.type==='TEST_TAKEN'){ liveAlarm=false; status.alarm='idle'; setDisc('ok','TAKEN','nice'); toast('Taken. '+(ev.latency!=null?ev.latency+' s':'')); }
+  if(ev.type==='REFUSED_30S'||ev.type==='TEST_REFUSED'){ liveAlarm=false; status.alarm='idle'; setDisc('ok','REFUSED','logged'); }
+  if(ev.type==='TEST_CANCELLED'){ liveAlarm=false; status.alarm='idle'; setDisc('ok','ARMED','test cancelled'); }
+  if(ev.type==='CLOCK_REJECTED') toast('Puck refused the clock write. Resolve the dose first, then sync.');
+  if(ev.type==='CLOCK_SYNC'||ev.type==='CLOCK_SET') toast('Clock set.');
+  if(ev.type==='BOOT_WDT') toast('The puck reset itself (watchdog).');
+  if(ev.type==='IMU_SKIPPED') toast('Puck skipped its motion sensor after a hung boot. Power-cycle to retry.');
+  renderAll();
+}
+function finishLog(truncated){
+  const lines=logBuf.slice(); logBuf=[]; $('log-progress').hidden=true;
+  const chk=PP.checkDump(lines);
+  rawLog = lines.join('\n'); events = lines.map(PP.parseEvent).filter(Boolean); logFresh=true;
+  logBytes=0; logAnnounced=0;
+  const w=$('log-warn');
+  if(truncated || !chk.complete){ w.hidden=false; w.textContent='Log looks incomplete ('+chk.got+' of '+chk.announced+' bytes arrived'+(truncated?', dump stalled':'')+'). Pull again before trusting it.'; }
+  else w.hidden=true;
+  if(link && !link.sim) { cache={ id:link.id, rawLog, at:Date.now() }; store('pp_cache', cache); }
+  renderAll(); toast('Log pulled: '+events.length+' events'+(chk.complete?'':' (incomplete)'));
+  $('btn-log-copy').disabled = !rawLog; $('btn-log').disabled=!link;
+}
+
+// ================= rendering =================
+function showWindow(open, text){
+  const w=$('window-warn');
+  if(open){ w.hidden=true; return; }
+  w.hidden=false; w.className='warn'; w.textContent = text || 'Puck is locked. Press the button on the puck once to open a 5-minute command window, then try again.';
+}
+function currentEpoch(){ return PP.splitEpochs(events); }
+// This connection's evidence only (live events + a pull); never a cached log from an earlier session (QA 2).
+function todayRow(){ if(!status.clockSet || !events.length) return null; return PP.summarizeDays(currentEpoch().current).find(d=>d.day===status.day) || null; }
+function isPastToday(st){ if(!st.dose||!st.clockSet) return false; const [hh,mm]=st.dose[st.dowKnown?st.dow:0].split(':').map(Number); return st.hh*60+st.mm >= hh*60+mm; }
+function renderStatus(){
+  const st=status;
+  $('hdr-clock').textContent = st.version||'';
+  if(st.clockSet){ $('s-clock').textContent = String(st.hh).padStart(2,'0')+':'+String(st.mm).padStart(2,'0')+'  day '+st.day+'  '+(st.dowKnown?DOW[st.dow]:'weekday UNKNOWN (sync!)'); }
+  else $('s-clock').textContent = 'NOT SET — sync now';
+  $('s-alarm').textContent = st.alarm||'—';
+  $('s-sensor').textContent = st.sensor||'—';
+  $('s-rec').textContent = st.recorder||'—';
+  if(st.window){ $('s-win').textContent = st.window.untilSync?'open until the clock is set':(st.window.open?('open, '+(st.window.left!=null?st.window.left+' s left':'')):'closed — press the puck button'); showWindow(st.window.open); }
+  const drift = PP.clockDriftSec(st);
+  let driftTxt = drift==null?'—':(Math.abs(drift)<60?'within a minute':(drift<0?'puck '+Math.round(-drift/60)+' min slow':'puck '+Math.round(drift/60)+' min fast'));
+  if(st.clockSet && st.dowKnown && st.dow!==new Date().getDay()) driftTxt += ' · WEEKDAY DIFFERS FROM PHONE ('+DOW[new Date().getDay()]+') — sync';   // QA 22
+  $('s-drift').textContent = driftTxt;
+  $('s-cell').textContent = st.cellV!=null ? st.cellV.toFixed(2)+' V (approx)' : '—';
+  $('s-reset').textContent = st.resetName ? st.resetName+' (0x'+st.resetReas.toString(16)+')' : '—';
+  if(st.dose && !schedDirty){ schedDraft = st.dose.slice(); renderSlots(); $('sched-state').textContent='on puck'; }
+  else if(st.dose && schedDirty){ $('sched-state').textContent='edited (puck has '+st.dose.join(' ')+')'; }
+  liveAlarm = (st.alarm==='ACTIVE'||st.alarm==='TEST');
+  if(st.alarm==='ACTIVE') setDisc('alarm','ALARM','open the bottle');
+  else if(st.alarm==='TEST') setDisc('alarm','TEST ALARM','tilt, hold, or R');
+  else if(!st.clockSet) setDisc('conn','NOT SET','sync the clock');
+  else if(st.sensor && st.sensor!=='ok') setDisc('locked','SENSOR '+st.sensor,'see status');
+  else setDisc('ok','ARMED', st.dowKnown?('next '+ (st.dose?PP.hm(...st.dose[(st.dow+(isPastToday(st)?1:0))%7].split(':').map(Number)):'')):'weekday unknown');
+  if(st.wdt && !wdtToasted){ wdtToasted=true; toast('Note: the puck\'s last reset was its watchdog.'); }
+  if(st.bleFault) toast('Puck reports BLE failed to start.');
+  updateButtons(); renderLast(); renderWeek(); renderTables();
+}
+function renderLast(){
+  const el=$('last-state'), big=$('last-big'), sub=$('last-sub');
+  const st=status; const row=todayRow();
+  if(!link){ el.className='na'; el.textContent='WAITING FOR PUCK'; big.textContent='—:—'; sub.textContent='the bottle will remember for you'; return; }
+  if(st.alarm==='ACTIVE'){ el.className='due'; el.textContent='ALARM RINGING'; big.textContent='NOW'; sub.textContent='it will not stop until you open the bottle'; return; }
+  if(row && (row.result==='TAKEN'||row.result==='MARKED (K)')){ el.className='ok'; el.textContent='TAKEN TODAY ✓'; big.textContent=PP.hm(row.at.hh,row.at.mm); sub.textContent='you’re covered. no second-guessing.'; return; }
+  if(row && row.result==='REFUSED'){ el.className='due'; el.textContent='REFUSED TODAY'; big.textContent=PP.hm(row.at.hh,row.at.mm); sub.textContent='okay :( … but please take it tomorrow.'; return; }
+  if(row && row.result==='UNKNOWN'){ el.className='na'; el.textContent='NOT WATCHED TODAY'; big.textContent='?'; sub.textContent='the puck had no clock during this dose window. did you take it?'; return; }   // QA3 finding 2
+  if(row && row.result==='MISSED'){ el.className='due'; el.textContent='MISSED TODAY'; big.textContent=PP.hm(row.at.hh,row.at.mm); sub.textContent='the window closed with the bottle unopened.'; return; }
+  if(row && row.result==='GAP SKIP'){ el.className='na'; el.textContent='SKIPPED TODAY'; big.textContent=PP.hm(row.at.hh,row.at.mm); sub.textContent='too soon after the last dose (min-gap guard).'; return; }
+  if(st.clockSet && st.dose){ const t=st.dose[st.dowKnown?st.dow:0].split(':').map(Number); el.className='due'; el.textContent= isPastToday(st)?(logFresh?'DUE — NOT YET TAKEN':'DUE — PULL THE LOG TO CHECK'):'NOT YET TODAY'; big.textContent=PP.hm(t[0],t[1]); sub.textContent= isPastToday(st)?'the puck will handle it':'next dose'; return; }
+  el.className='na'; el.textContent= st.clockSet?'NO RECORD YET':'CLOCK NOT SET'; big.textContent='—:—'; sub.textContent= st.clockSet?'pull the log to see history':'sync the clock to arm the puck';
+}
+function renderWeek(){
+  const wk=$('week'); wk.innerHTML=''; const st=status;
+  const src = events.length ? currentEpoch().current : [];
+  const days=PP.summarizeDays(src); const byDay=new Map(days.map(d=>[d.day,d]));
+  const today = st.clockSet? st.day : null; const dow0 = (st.clockSet&&st.dowKnown)? ((st.dow - (today%7) + 7)%7) : null;
+  const end = today!=null? today : 6;
+  for(let d=end-6; d<=end; d++){
+    const row=byDay.get(d); const div=document.createElement('div'); div.className='day';
+    const b=document.createElement('b'); b.textContent = dow0!=null? DOWS[(dow0+((d%7)+7)%7)%7] : (d<0?'':'d'+d);
+    const dot=document.createElement('div'); dot.className='dot'+(d===today?' today':'');
+    if(row){ if(row.result==='TAKEN'||row.result==='MARKED (K)'){dot.classList.add('t'); dot.textContent='✓';}
+      else if(row.result==='MISSED'){dot.classList.add('m'); dot.textContent='✕';}
+      else if(row.result==='UNKNOWN'){dot.textContent='?';}
+      else if(row.result==='REFUSED'){dot.classList.add('r'); dot.textContent='–';}
+      else if(row.result==='RINGING'){dot.classList.add('m'); dot.textContent='!';} }
+    div.appendChild(b); div.appendChild(dot); wk.appendChild(div);
+  }
+  $('week-hint').textContent = !link ? 'Connect a puck.' : (logFresh ? 'Last 7 puck days ending today (this boot).' : (events.length ? 'Live events only — pull the log for history.' : 'Pull the log to fill this in.'));
+}
+function renderTables(){
+  const st=status; const today=(st.clockSet&&events.length)?st.day:null;
+  const fresh = events.length>0;                                   // this connection's evidence
+  const ep = fresh ? currentEpoch() : null;
+  const cachedEv = (!fresh && cache) ? cache.rawLog.split('\n').map(PP.parseEvent).filter(Boolean) : [];
+  const src = fresh ? ep.current : PP.splitEpochs(cachedEv).current;
+  const days=PP.summarizeDays(src);
+  const tb=$('dosetable').querySelector('tbody'); tb.innerHTML=''; $('dosetable').hidden = !days.length;
+  $('log-meta').textContent = fresh ? (events.length+' events'+(logFresh?'':' (live only)')+(ep.epochs>1?' · '+ep.epochs+' boots, showing the current one':'')) : (cache?'last pull, previous session — pull again':'');
+  for(const r of days.slice().reverse()){
+    const tr=document.createElement('tr');
+    const date = today!=null? PP.dayToDate(r.day,today,statusAt||Date.now()).toLocaleDateString(undefined,{month:'short',day:'numeric'}) : '—';
+    const cls = r.result==='TAKEN'||r.result==='MARKED (K)'?'b-t': r.result==='MISSED'||r.result==='REFUSED'?'b-r': r.result==='RINGING'?'b-a':'b-i';
+    tr.innerHTML = `<td class="mono">${h(r.day)}</td><td>${h(date)}</td><td><span class="badge ${cls}">${h(r.result||'—')}</span>${r.partials?` <span class="badge b-i">${h(r.partials)} partial</span>`:''}${r.notes.length?`<div class="hint">${r.notes.map(n=>h(n)).join(' · ')}</div>`:''}</td><td class="mono">${r.at?h(PP.hm(r.at.hh,r.at.mm)):(r.start?h(PP.hm(r.start.hh,r.start.mm)):'—')}</td><td class="mono">${r.latency!=null?h(r.latency)+' s':'—'}</td>`;
+    tb.appendChild(tr);
+  }
+  const eb=$('evtable').querySelector('tbody'); eb.innerHTML='';
+  const all = fresh ? events : cachedEv;
+  for(const e of all.slice().reverse()){
+    const tr=document.createElement('tr');
+    const cls = /TAKEN/.test(e.type)?'b-t': /REFUSED|MISSED|REJECTED|FAULT|WDT|SKIPPED/.test(e.type)?'b-r': /ALARM/.test(e.type)?'b-a':'b-i';
+    const detail = e.type==='NOTE'? h(e.text) : e.latency!=null? h(e.latency)+' s' : e.peak!=null? h(e.peak)+'°' : e.reas!=null? h(PP.resetReasonName(e.reas)+' (0x'+e.reas.toString(16)+')') : '';
+    tr.innerHTML = `<td class="mono">${e.day===null?'—':h(e.day)}</td><td class="mono">${e.hh===null?'—':h(String(e.hh).padStart(2,'0')+':'+String(e.mm).padStart(2,'0'))}</td><td><span class="badge ${cls}">${h(e.type)}</span></td><td>${detail}</td>`;
+    eb.appendChild(tr);
+  }
+}
+function renderSlots(){
+  const box=$('slots'); box.innerHTML='';
+  if(!schedDraft) schedDraft = Array(7).fill('09:00');
+  schedDraft.forEach((t,i)=>{ const row=document.createElement('div'); row.className='slot';
+    row.innerHTML=`<span class="dn">${DOW[i]}</span><input type="time" value="${h(t)}" data-i="${i}">`;
+    const inp=row.querySelector('input');
+    inp.addEventListener('input',()=>{ schedDraft[i]=inp.value; schedDirty=true; inp.classList.toggle('dirty', !!(status.dose && status.dose[i]!==inp.value)); $('sched-state').textContent='edited'; updateButtons(); });
+    box.appendChild(row); });
+}
+function renderAll(){ renderLast(); renderWeek(); renderTables(); updateButtons(); }
+function updateButtons(){
+  const on=!!link;
+  for(const id of ['btn-sync','btn-status','btn-log','btn-note','btn-x','btn-raw','btn-sched-all']) $(id).disabled=!on;
+  document.querySelectorAll('.note-q').forEach(b=>b.disabled=!on);
+  $('btn-log-copy').disabled=!rawLog;
+  $('btn-sched-save').disabled = !(on && schedDirty && schedDraft && schedDraft.every(PP.hmOk));
+  const row=todayRow();
+  $('btn-k').disabled = !(on && status.clockSet && isPastToday(status) && !(row && row.result && row.result!=='RINGING') && status.alarm==='idle');   // QA 9 + QA3 finding 2: any closer already on today disables K
+  $('btn-r').disabled = !(on && status.alarm==='TEST');   // QA 13
+  $('btn-x').disabled = !(on && status.alarm==='idle');
+}
+
+// ================= sending (serialized, QA 7) =================
+let sendQ = Promise.resolve();
+function send(line){
+  if(!link){ toast('No puck connected'); return Promise.resolve(); }
+  const l=link;
+  sendQ = sendQ.then(async ()=>{ if(link!==l) return; con('tx', line); try{ await l.send(line); }catch(e){ con('sys','send failed: '+e.message); toast('Send failed: '+e.message); } }).catch(()=>{});
+  return sendQ;
+}
+async function syncClock(force){
+  if(Date.now()-lastSyncAt<5000 && !force){ toast('Just synced'); return; }
+  const drift=PP.clockDriftSec(status);
+  if(status.clockSet && drift!=null && drift>60 && !force){
+    if(!confirm('The puck is '+Math.round(drift/60)+' min FAST. Moving its clock back is refused while a dose is pending or ringing. Sync anyway?')) return;
+  }
+  lastSyncAt=Date.now();
+  await send('E '+PP.unixLocalNow());
+}
+async function saveSchedule(){
+  if(!schedDraft) return;
+  const draft = schedDraft.slice();                      // QA 10: snapshot
+  if(!draft.every(PP.hmOk)){ toast('Every day needs a valid HH:MM'); return; }
+  const same = draft.every(t=>t===draft[0]);
+  if(same){ await send('D '+draft[0]); }
+  else { for(let i=0;i<7;i++){ if(!status.dose || status.dose[i]!==draft[i]) await send('D '+DOW[i]+' '+draft[i]); } }
+  schedDirty=false; $('sched-state').textContent='saving…';
+  await send('S');
+}
+
+// ================= real BLE link =================
+async function connectBle(device){
+  if(!navigator.bluetooth){ toast('This browser has no Web Bluetooth. Use Chrome or Edge on desktop or Android.'); return; }
+  if(!device){
+    try{ device = await navigator.bluetooth.requestDevice({ filters:[{namePrefix:'PillPuck'}], optionalServices:[NUS_SVC] }); }
+    catch(e){ con('sys','chooser: '+e.message); return; }
+  }
+  setDisc('conn','CONNECTING', device.name||'');
+  inLog=false; logBuf=[]; logBytes=0; logAnnounced=0; status={}; logFresh=false; events=[]; rawLog=''; schedDirty=false; wdtToasted=false;   // QA 2/4
+  try{
+    device.addEventListener('gattserverdisconnected', onDisconnected, {once:true});   // QA 19
+    const server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(NUS_SVC);
+    const tx = await svc.getCharacteristic(NUS_TX);
+    const rx = await svc.getCharacteristic(NUS_RX);
+    let buf=''; const dec = new TextDecoder('utf-8');
+    tx.addEventListener('characteristicvaluechanged', ev=>{
+      buf += dec.decode(ev.target.value, {stream:true});
+      let i; while((i=buf.indexOf('\n'))>=0){ const l=buf.slice(0,i).replace(/\r$/,''); buf=buf.slice(i+1); if(l.length) onLine(l); }
+    });
+    await tx.startNotifications();
+    const enc = new TextEncoder();
+    link = { sim:false, device, id:device.id,
+      // QA 5: write WITH response in <=20-byte pieces so an MTU-23 Android stack can never truncate a note
+      send: async (line)=>{ const data=enc.encode(line+'\n'); for(let i=0;i<data.length;i+=20){ await rx.writeValue(data.slice(i,i+20)); } },
+      close: ()=>{ try{ device.gatt.disconnect(); }catch(e){} } };
+    lastDevice=device;
+    $('btn-ble').textContent='Disconnect';
+    updateButtons(); con('sys','connected to '+(device.name||'puck')+' — asking for status');
+    if(cache && cache.id!==device.id){ cache=null; try{ localStorage.removeItem('pp_cache'); }catch(e){} }
+    renderAll();
+    await send('S');
+    statusWaitTimer=setTimeout(()=>{ if(link && !status.complete){ setDisc('locked','NO REPLY','press the puck button'); showWindow(false,'No reply from the puck. Its command window is probably closed — press its button once, then Refresh.'); } }, 3000);
+    // auto-sync ONLY forward moves / unset clock / unknown weekday, only when idle (QA 3/11/18); then auto-pull the log once
+    setTimeout(async ()=>{
+      if(!link || !status.complete) return;
+      if(status.alarm==='idle' && !liveAlarm){
+        const drift=PP.clockDriftSec(status);
+        if(!status.clockSet || !status.dowKnown || (drift!=null && drift<=-60)){ con('sys','auto-sync (drift '+(drift==null?'unknown':drift+' s')+')'); await syncClock(true); }
+      }
+      if(!logFresh && status.window && status.window.open){ await pullLog(); }
+    }, 1800);
+  }catch(e){ con('sys','connect failed: '+e.message); toast('Connect failed: '+e.message); setDisc('idle','NO PUCK','tap Find my puck'); try{ device.gatt.disconnect(); }catch(_){} link=null; updateButtons(); }
+}
+function onDisconnected(){ link=null; inLog=false; logBuf=[]; liveAlarm=false; updateButtons(); setDisc('idle','NO PUCK','disconnected'); $('btn-ble').textContent= lastDevice?'Reconnect':'Find my puck'; con('sys','disconnected'); renderLast(); }
+async function pullLog(){ if(inLog) { toast('Already pulling'); return; } logBuf=[]; inLog=false; logBytes=0; logAnnounced=0; $('log-warn').hidden=true; $('btn-log').disabled=true; await send('L'); armLogTimer(); }
+
+// ================= demo puck (simulator of the v0.7 text protocol) =================
+function makeSim(){
+  const DEMO_HISTORY = ['EVENT BOOT reas=0x0','EVENT CLOCK_SYNC day=0 08:34','EVENT ALARM_START day=0 09:00','EVENT DOSE_TAKEN day=0 09:01 latency_s=52','EVENT NOTE day=0 12:10 out, bottle with me','EVENT ALARM_START day=1 09:00','EVENT OPEN_PARTIAL day=1 09:00 peak_deg=71','EVENT DOSE_TAKEN day=1 09:03 latency_s=190','EVENT ALARM_START day=2 09:00','EVENT REFUSED_30S day=2 09:02','EVENT DOSE_MISSED day=3 13:00','EVENT ALARM_START day=4 09:00','EVENT DOSE_TAKEN day=4 09:24 latency_s=1479'];
+  const s = { clockSet:false, hh:0, mm:0, day:-1, dow:null, dose:Array(7).fill('09:00'), alarm:'idle', log:DEMO_HISTORY.slice(), win:{open:true, untilSync:true, left:null}, lastNote:0, boot:Date.now() };
+  const out = l=>setTimeout(()=>onLine(l), 60);
+  const stamp = ()=>{ const t=new Date(); return s.clockSet? String(t.getHours()).padStart(2,'0')+':'+String(t.getMinutes()).padStart(2,'0') : '00:0'+Math.min(9,Math.floor((Date.now()-s.boot)/60000)); };
+  const ev = (type,extra)=>{ const line='EVENT '+type+' day='+s.day+' '+stamp()+(extra?' '+extra:''); s.log.push(line); out(line); };
+  const statusBlock = ()=>{ out('---- PillPuck v0.7 status ----');
+    out(s.clockSet? 'clock: '+stamp()+'  day '+s.day+'  weekday '+(s.dow==null?'UNKNOWN (send E)':DOW[s.dow]) : 'clock: NOT SET  <-- send E <unix_local_sec> (or bench T HH:MM)');
+    out('dose: '+s.dose.join(' ')); out('      SUN   MON   TUE   WED   THU   FRI   SAT');
+    out('alarm: '+s.alarm+'   sensor: ok   recorder: ok');
+    out('resting pose: yes   BLE: connected ('+(s.win.untilSync?'window OPEN until the clock is set':(winOpen()?'window OPEN, '+s.win.left+' s left':'window closed - press the button'))+')');
+    out('cell: 2.93 V (divider, approx)   last reset: power lost or brown-out (0x0)'); };
+  function winOpen(){ if(s.win.untilSync) return true; if(!s.win.open) return false; s.win.left=Math.max(0,Math.round((s.win.deadline-Date.now())/1000)); if(s.win.left<=0){ s.win.open=false; return false;} return true; }
+  const openWin=ms=>{ s.win={open:true, untilSync:false, deadline:Date.now()+ms, left:Math.round(ms/1000)}; };
+  return { sim:true, id:'demo',
+    send: async (line)=>{
+      const c=line.trim(); const c0=c[0]?c[0].toUpperCase():'';
+      if(!winOpen()){ out('locked - press the puck button to open a command window'); return; }
+      switch(c0){
+        case 'E': { const v=parseInt(c.slice(1).trim(),10); if(!(v>1577836800&&v<4733510400)){ out('? usage: E <unix_local_seconds>  (sender applies timezone)'); return; }
+          const first=!s.clockSet; s.clockSet=true; const t=new Date(); s.hh=t.getHours(); s.mm=t.getMinutes(); const ud=Math.floor(v/86400); s.dow=(4+ud)%7; if(s.day<0) s.day=5;
+          if(first) openWin(300000); ev('CLOCK_SYNC'); statusBlock(); return; }
+        case 'S': statusBlock(); return;
+        case 'D': { if(s.alarm!=='idle'){ out('? not while a dose is pending or ringing - resolve it first (open the bottle), then set the schedule'); return; }
+          const m=/^D\s+(?:([A-Z]{3})\s+)?(\d{2}:\d{2})$/i.exec(c); if(!m){ out('? usage: D HH:MM   or   D MON 04:30'); return; }
+          if(m[1]){ const i=DOW.indexOf(m[1].toUpperCase()); if(i<0){ out('? usage: D HH:MM   or   D MON 04:30'); return; } s.dose[i]=m[2]; out('weekday dose set:'); } else { s.dose=Array(7).fill(m[2]); out('dose time set (ALL days):'); }
+          statusBlock(); return; }
+        case 'X': if(s.alarm==='idle'){ s.alarm='TEST'; ev('TEST_ALARM'); out('  I won\'t stop until you do.'); } return;
+        case 'R': if(s.alarm==='TEST'){ s.alarm='idle'; ev('TEST_CANCELLED'); } else out('R cancels TEST alarms only. Real ones: open the bottle.'); return;
+        case 'K': if(!s.clockSet||s.alarm!=='idle'){ out('? K needs: clock set, no alarm ringing, today not already handled, and no earlier day still unresolved (let it ring or be recorded first)'); return; } ev('DOSE_MARKED_TAKEN'); return;
+        case 'N': { const t=c.slice(1).trim(); if(!PP.noteOk(t)){ out(/event/i.test(t)?'? a note may not contain the word EVENT':'? usage: N <up to 40 chars>   e.g.  N out, bottle in bag'); return; }
+          if(Date.now()-s.lastNote<10000){ out('? one note per 10 s'); return; } s.lastNote=Date.now(); ev('NOTE', t); return; }
+        case 'L': { if(s.alarm!=='idle'){ out('? alarm is ringing - deal with that first'); return; }
+          out('/log.old: empty'); out('---- /log.txt ('+(s.log.join('\n').length+1)+' bytes) ----'); s.log.forEach(out); out('---- end of log ----'); return; }
+        default: out('E unix=dated sync  T HH:MM  D HH:MM  D MON 04:30  G HH:MM min-gap  X test  R cancel-test  K mark-taken  N note  L dump  C YES clear  F YES format  S status');
+      }
+    },
+    close: ()=>{}, simTake: ()=>{ if(s.alarm!=='idle'){ const wasTest=s.alarm==='TEST'; s.alarm='idle'; ev(wasTest?'TEST_TAKEN':'DOSE_TAKEN','latency_s=17'); openWin(180000);} },
+    simButton: ()=>{ openWin(300000); out('BLE window open 5 min - connect with nRF Connect (UART)'); }
+  };
+}
+
+// ================= wiring =================
+$('btn-ble').addEventListener('click', ()=>{
+  if(link){ const wasSim=link.sim; link.close(); if(wasSim){ link=null; document.body.classList.remove('simming'); onDisconnected(); } return; }
+  if(lastDevice && !lastDevice.gatt.connected && $('btn-ble').textContent==='Reconnect'){ connectBle(lastDevice); return; }
+  connectBle();
+});
+$('btn-sim').addEventListener('click', ()=>{ if(link) link.close(); lastDevice=null; link=makeSim(); document.body.classList.add('simming'); status={}; events=[]; rawLog=''; logFresh=false; schedDirty=false; updateButtons(); $('btn-ble').textContent='Disconnect'; setDisc('conn','DEMO','not a real puck'); con('sys','demo puck'); send('S'); });
+$('disc').addEventListener('click', ()=>{ if(link&&link.sim){ if(liveAlarm) link.simTake(); else link.simButton(); setTimeout(()=>send('S'),400); } });
+$('btn-sync').addEventListener('click', ()=>syncClock(false));
+$('btn-status').addEventListener('click', ()=>send('S'));
+$('btn-log').addEventListener('click', pullLog);
+$('btn-log-copy').addEventListener('click', async ()=>{ try{ await navigator.clipboard.writeText(rawLog); toast('Raw log copied'); }catch(e){ toast('Copy failed'); } });
+$('btn-note').addEventListener('click', ()=>{ const t=$('note-text').value; if(!PP.noteOk(t)){ toast('Up to 40 plain characters, and not the word EVENT'); return; } send('N '+t.trim()); $('note-text').value=''; });
+document.querySelectorAll('.note-q').forEach(b=>b.addEventListener('click', ()=>send('N '+b.dataset.n)));
+$('btn-k').addEventListener('click', ()=>{ if(confirm('Mark today\'s dose as already handled? Only for a reboot inside the dose window when you already took it. This is logged as DOSE_MARKED_TAKEN, not DOSE_TAKEN.')) send('K'); });
+$('btn-x').addEventListener('click', ()=>send('X'));
+$('btn-r').addEventListener('click', ()=>send('R'));
+$('btn-raw').addEventListener('click', ()=>{ const c=$('raw-cmd').value.trim(); if(!c) return; if(/^[CF]\s+YES$/i.test(c) && !confirm(c.toUpperCase()+' erases the puck\'s record. Pull the log first. Continue?')) return; send(c); $('raw-cmd').value=''; });
+$('raw-cmd').addEventListener('keydown', e=>{ if(e.key==='Enter') $('btn-raw').click(); });
+$('btn-sched-all').addEventListener('click', ()=>{ if(!schedDraft) schedDraft=Array(7).fill('09:00'); const t=schedDraft[0]; schedDraft=Array(7).fill(t); schedDirty=true; renderSlots(); $('sched-state').textContent='edited'; updateButtons(); });
+$('btn-sched-save').addEventListener('click', saveSchedule);
+
+renderSlots(); renderAll();
+if(!navigator.bluetooth) con('sys','No Web Bluetooth in this browser. The demo puck still works.');
+</script>
+<script>if("serviceWorker" in navigator){window.addEventListener("load",()=>{navigator.serviceWorker.register("sw.js").catch(()=>{});});}</script>
+</body>
+</html>
