@@ -15,6 +15,9 @@
   piece lost in a 1361-byte dump). Exact byte-count check, both file lines required, up to 3 pulls, only a
   complete pull is shown as events or cached, mid-dump stall handling, refusals end the pull at once.
   Also remembers the puck: getDevices + watchAdvertisements reconnect on open with no chooser (feature-detected).
+  App build 3 (Sep 13 2026, A13): block-mode log pull. Sends "L 0"; a v0.7.1b puck answers in 1000-byte blocks
+  with byte counts, the app re-asks any short block and reassembles the plain-L archive text byte for byte.
+  Older pucks ignore the argument and the build-2 retry path handles their plain dump.
   over the Nordic UART Service text-command channel. Web Bluetooth: Chrome / Edge on desktop and
   Android. iPhone Safari does not support Web Bluetooth.
   There is NO dismiss control in this app and no command in the protocol that could be one.
@@ -138,7 +141,7 @@
 <div class="wrap">
   <header>
     <div class="wordmark">Pill<span>Puck</span></div>
-    <div class="tag">companion · v0.7 protocol · app build 2 (Sep 13)</div>
+    <div class="tag">companion · v0.7 protocol · app build 3 (Sep 13)</div>
   </header>
 
   <div class="puckzone">
@@ -403,9 +406,90 @@ let statusTimer=null, statusWaitTimer=null;
 let liveAlarm=false;           // alarm state as last seen (events or status)
 let wdtToasted=false, lastSyncAt=0, lastDevice=null;
 
+// ================= receive path (build 3: block dumps, A13) =================
+// Everything the puck sends comes through rxFeed(). Normally it is split into lines for onLine(). While a
+// block of the log is arriving (firmware change 23, "L <n>"), the next blk.need bytes are raw log content
+// that may end mid-record, so they are captured byte-counted instead of line-split.
+let rxBuf='', rxCount=0;   // rxCount: bytes since the last L, so a silent puck is told apart from a mangled reply
+let blk=null;   // {n,N,total,old,txt, need, buf, got, tries}
+const BLOCK_TRIES=3;
+function rxReset(){ rxBuf=''; }
+function rxFeed(text){
+  rxBuf += text; rxCount += text.length;
+  for(;;){
+    if(blk && blk.need>0){
+      const take=Math.min(blk.need, rxBuf.length);
+      blk.buf += rxBuf.slice(0,take); rxBuf=rxBuf.slice(take); blk.need-=take;
+      if(take){ logBytes=blk.got.length+blk.buf.length; showLogProgress(); armLogTimer(STALL_MS); }
+      if(blk.need>0) return;
+    }
+    const i=rxBuf.indexOf('\n'); if(i<0) return;
+    const l=rxBuf.slice(0,i).replace(/\r$/,''); rxBuf=rxBuf.slice(i+1); if(l.length) onLine(l);
+  }
+}
+const BLOCK_HDR=/^---- block (\d+)\/(\d+) off=(\d+) len=(\d+) total=(\d+) old=(\d+) txt=(\d+) ----/;   // no $: a lost header newline fuses content onto it
+const BLOCK_END=/^---- block (\d+) done ----$/;
+const BLOCK_RESTARTS=2;
+function onBlockHeader(m){
+  const n=+m[1], N=+m[2], off=+m[3], len=+m[4], total=+m[5], old=+m[6], txt=+m[7];
+  if(!blk){ blk={ n:0, N, total, old, txt, need:0, len:0, buf:'', got:'', tries:0, restarts:0 }; logAnnounced=total; }
+  if(N!==blk.N || total!==blk.total || old!==blk.old || txt!==blk.txt){
+    // the log changed under us (an event was appended, or it rotated): adopt the new shape and start over
+    blk.restarts++;
+    if(blk.restarts>BLOCK_RESTARTS){ const b=blk; blk=null; blockFail='the log kept changing during the pull ('+b.restarts+' restarts)'; logBuf=[]; finishLog(true,false); return; }
+    con('sys','log changed during the pull (total '+blk.total+' -> '+total+') - starting over, restart '+blk.restarts);
+    blk.N=N; blk.total=total; blk.old=old; blk.txt=txt; blk.got=''; blk.n=0; blk.tries=0; logAnnounced=total;
+    blk.need=len; blk.len=len; blk.buf=''; blk.stale=true; blk.staleN=n; blk.restartPending=true; if(len===0) onBlockDone(n); else armLogTimer(STALL_MS); return; }
+  if(n!==blk.n || off!==blk.got.length){   // a stale or repeated block (late bytes of a re-asked block): swallow its bytes
+    con('sys','unexpected block header '+n+'/'+N+' off='+off+' (wanted '+blk.n+' at '+blk.got.length+')'); blk.need=len; blk.len=len; blk.buf=''; blk.stale=true; blk.staleN=n; if(len===0) onBlockDone(n); else armLogTimer(STALL_MS); return; }
+  blk.stale=false; blk.need=len; blk.len=len; blk.buf='';
+  if(len===0){ onBlockDone(n); }
+  else armLogTimer(STALL_MS);
+}
+function onBlockDone(n){
+  if(!blk) return;
+  if(blk.stale){ if(n===blk.staleN){ blk.stale=false; blk.buf=''; if(blk.restartPending){ blk.restartPending=false; requestBlock(); } else armLogTimer(STALL_MS); } return; }   // stale block drained: re-ask only after a geometry restart
+  if(n!==blk.n){ return; }
+  if(blk.need!==0 || blk.buf.length!==blk.len){ return; }
+  blockExact=true;
+  blk.got += blk.buf; blk.buf=''; blk.tries=0;
+  if(blk.n+1 < blk.N){ blk.n++; requestBlock(); return; }
+  finishBlocks();
+}
+function requestBlock(){ const l=link; if(!l) return; if(l.resetBuf) l.resetBuf(); blk.need=0; blk.buf=''; armLogTimer(REPLY_MS); l.send('L '+blk.n); }
+function onNoBlock(){   // the puck says that block does not exist any more: the log shrank (rotation, C YES). Start over.
+  if(!blk) return; blk.restarts++;
+  if(blk.restarts>BLOCK_RESTARTS){ const b=blk; blk=null; blockFail='the log kept changing during the pull ('+b.restarts+' restarts)'; logBuf=[]; finishLog(true,false); return; }
+  con('sys','puck has no block '+blk.n+' any more - starting over, restart '+blk.restarts); blk.got=''; blk.n=0; blk.tries=0; blk.total=-1; blk.restarts--; requestBlock();   // block 0's header will re-count this restart when it adopts the new shape
+}
+function blockStall(){
+  // no header, or fewer bytes than announced, within the timer: one notify piece is gone. Ask for the block again.
+  blk.tries++;
+  con('sys','block '+blk.n+' of '+blk.N+' stalled ('+blk.buf.length+' bytes in) - try '+(blk.tries+1)+' of '+BLOCK_TRIES);
+  if(blk.tries>=BLOCK_TRIES){ const b=blk; blk=null; pullRefused=null; logBuf=[]; blockFail='block '+b.n+' of '+b.N+' lost '+BLOCK_TRIES+' times ('+b.got.length+' of '+b.total+' bytes in)'; finishLog(true,false); return; }
+  logSwallow=Date.now()+STALL_MS;       // late bytes of the failed block must not become live events
+  requestBlock();
+}
+let blockFail=null, blockExact=false;
+function finishBlocks(){
+  const b=blk; blk=null;
+  const text=b.got;
+  if(text.length!==b.total){ blockFail='assembled '+text.length+' of '+b.total+' bytes'; logBuf=[]; finishLog(true,false); return; }
+  const split=(t)=>t.split('\n').map(x=>x.replace(/\r$/,'')).filter(x=>x.length);
+  const lines=[];
+  if(b.old===0) lines.push('/log.old: empty'); else { lines.push('---- /log.old ('+b.old+' bytes) ----'); lines.push(...split(text.slice(0,b.old))); }
+  if(b.txt===0) lines.push('/log.txt: empty'); else { lines.push('---- /log.txt ('+b.txt+' bytes) ----'); lines.push(...split(text.slice(b.old))); }
+  lines.push('---- end of log ----');
+  logBuf=lines; inLog=false; clearTimeout(logTimer); blockExact=true; finishLog(false);
+}
+
 // ================= line dispatch =================
 function onLine(line){
   con('rx', line);
+  if(pulling){ let m=BLOCK_HDR.exec(line); if(m){ const rest=line.slice(m[0].length); onBlockHeader(m); if(rest) rxBuf=rest+'\n'+rxBuf; return; } m=BLOCK_END.exec(line); if(m){ onBlockDone(+m[1]); return; } if(blk && /^\? no block /.test(line)){ onNoBlock(); return; }
+    // QA: during a block pull the puck is single-threaded, so any EVENT line that reaches here is dump content
+    // that escaped framing (lost header), not a live event - except a live alarm, which is never in a dump mid-pull
+    if(!inLog && /^EVENT /.test(line)){ con('sys','dropped stray dump line during block pull'); return; } }
   const isHeader = /^---- \/log\.(txt|old) \((\d+) bytes\) ----/.test(line) || /^\/log\.(txt|old): empty/.test(line) || /^---- RAW FLASH SCAN/.test(line);
   const isEnd = /---- end of log ----/.test(line) || /^---- raw scan: \d+ text runs ----/.test(line);   // v0.7.1 raw scan has no end-of-log marker
   // After a mid-dump stall the rest of that dump is NOT live traffic. Only dump-shaped lines (EVENT records and
@@ -417,7 +501,7 @@ function onLine(line){
   if(isHeader){ inLog=true; logBuf.push(line); const m=/\((\d+) bytes\)/.exec(line); if(m) logAnnounced+=+m[1]; armLogTimer(STALL_MS); showLogProgress(); return; }
   if(inLog){ logBuf.push(line); logBytes+=line.length+1; armLogTimer(STALL_MS); showLogProgress(); return; }
   if(/^locked - press the puck button/.test(line)){ showWindow(false); setDisc('locked','LOCKED','press the puck button'); toast('Puck is locked. Press its button once to open a 5-minute window.'); if(pulling){ pullRefused='locked'; finishLog(true); } return; }
-  if(/^\? alarm is ringing/.test(line) && pulling){ pullRefused='alarm'; finishLog(true); toast('The puck will not dump its log while an alarm is ringing.'); return; }
+  if(/^\? alarm is ringing/.test(line) && pulling){ pullRefused='alarm'; finishLog(true); toast('The puck will not dump its log while an alarm is ringing.'); send('S'); return; }
   if(/^BLE window open 5 min/.test(line)){ showWindow(true); toast('Window open for 5 minutes'); send('S'); return; }
   if(/^log cleared/.test(line)){ rawLog=''; rawLogOk=false; events=[]; logFresh=true; cache=null; try{ localStorage.removeItem('pp_cache'); }catch(e){} renderAll(); toast('Log cleared on the puck'); return; }
   if(/^R cancels TEST alarms only/.test(line)){ toast('R only cancels TEST alarms. A real alarm ends at the bottle.'); return; }
@@ -431,7 +515,7 @@ function onLine(line){
 // dump lines once the dump has started; v0.7.x gives each notify piece up to ~2.2 s of retries and a line can
 // be 4 pieces at MTU 23, so 4 s was too short. On a mid-dump stall the rest of that dump is swallowed.
 const REPLY_MS=4000, STALL_MS=12000;
-function armLogTimer(ms){ clearTimeout(logTimer); logTimer=setTimeout(()=>{ if(inLog || pulling){ const mid=inLog; inLog=false; finishLog(true, mid); } }, ms); }
+function armLogTimer(ms){ clearTimeout(logTimer); logTimer=setTimeout(()=>{ if(blk){ blockStall(); return; } if(inLog || pulling){ const mid=inLog; inLog=false; finishLog(true, mid); } }, ms); }
 function showLogProgress(){ const p=$('log-progress'); p.hidden=false; p.textContent='pulling… '+logBytes+(logAnnounced?' of '+logAnnounced:'')+' bytes'; }
 function liveEvent(ev){
   if(ev.day!==null || EPOCH_MARKERS.has(ev.type)){ events.push(ev); }
@@ -447,22 +531,26 @@ function liveEvent(ev){
   renderAll();
 }
 function finishLog(truncated, midDump){
+  blk=null; const wasExact=blockExact; blockExact=false;
   const lines=logBuf.slice(); logBuf=[]; clearTimeout(logTimer); $('log-progress').hidden=true; logBytes=0; logAnnounced=0;
   const chk=PP.checkDump(lines);
   const refused=pullRefused; pullRefused=null;
-  const nothing = !chk.sawAny;                                   // no dump: locked puck, alarm ringing, link gone, or a stray end marker
-  const complete = !nothing && (chk.raw || (!truncated && chk.complete));
+  const nothing = !chk.sawAny && !blockFail;                     // no dump: locked puck, alarm ringing, link gone, or a stray end marker
+  const complete = !nothing && (chk.raw || (!truncated && (chk.complete || (wasExact && chk.sawFile))));
   // a stall with records still owed: the rest of that dump may trickle in; swallow EVENT lines for a while (QA 3)
   if(truncated && midDump && !chk.raw && chk.got<chk.announced) logSwallow=Date.now()+STALL_MS;
-  const cause = refused ? refused : nothing ? 'no dump' : chk.raw ? 'raw scan' : truncated ? 'stalled after '+chk.got+' of '+chk.announced+' bytes' : !chk.sawFile ? 'a file header line was lost' : chk.got<chk.announced ? (chk.announced-chk.got)+' bytes lost ('+chk.got+' of '+chk.announced+')' : chk.got>chk.announced ? 'extra bytes ('+chk.got+' of '+chk.announced+')' : 'end marker missing';
+  const cause = blockFail ? blockFail : refused ? refused : nothing ? 'no dump' : chk.raw ? 'raw scan' : truncated ? 'stalled after '+chk.got+' of '+chk.announced+' bytes' : !chk.sawFile ? 'a file header line was lost' : chk.got<chk.announced ? (chk.announced-chk.got)+' bytes lost ('+chk.got+' of '+chk.announced+')' : chk.got>chk.announced ? 'extra bytes ('+chk.got+' of '+chk.announced+')' : 'end marker missing';
   if(!pullBest || complete || (!nothing && chk.got>pullBest.chk.got)) pullBest={lines,chk,truncated,complete,cause};
-  if(!complete && !nothing && !refused && pullAttempt<PULL_MAX && link && !link.sim){
+  if(blockFail){ pullBest={lines,chk,truncated,complete:false,cause}; }
+  const silent = nothing && rxCount===0;                         // nothing at all came back: do not hammer a puck that is not answering
+  if(!complete && !silent && !refused && !blockFail && pullAttempt<PULL_MAX && link && !link.sim){
     con('sys','pull '+pullAttempt+' of '+PULL_MAX+': '+cause+' - pulling again');
     toast('Pull '+pullAttempt+': '+cause+'. Pulling again, '+(pullAttempt+1)+' of '+PULL_MAX+'…');
     const l=link; setTimeout(()=>{ if(link===l && !inLog) pullOnce(); }, 800);   // stays 'pulling' across the gap (QA 4)
     return;
   }
   pulling=false;
+  if(wasExact || blockFail){ setTimeout(()=>{ if(link) send('S'); }, 300); }   // block pulls swallow live lines: refresh the truth
   const best=pullBest; pullBest=null;
   const w=$('log-warn');
   const refusedNote = refused==='locked' ? 'The puck is now locked: press its button once before pulling again. ' : refused==='alarm' ? 'The puck is now ringing: deal with the dose at the bottle first. ' : '';
@@ -683,25 +771,22 @@ async function connectBle(device){
     catch(e){ con('sys','chooser: '+e.message); return; }
   }
   setDisc('conn','CONNECTING', device.name||'');
-  inLog=false; logBuf=[]; logBytes=0; logAnnounced=0; status={}; logFresh=false; events=[]; rawLog=''; rawLogOk=false; pullBest=null; pullAttempt=0; schedDirty=false; wdtToasted=false; $('log-warn').hidden=true;   // QA 2/4
+  inLog=false; logBuf=[]; logBytes=0; logAnnounced=0; status={}; logFresh=false; events=[]; rawLog=''; rawLogOk=false; pullBest=null; pullAttempt=0; blk=null; blockFail=null; rxReset(); schedDirty=false; wdtToasted=false; $('log-warn').hidden=true;   // QA 2/4
   try{
     device.addEventListener('gattserverdisconnected', onDisconnected, {once:true});   // QA 19
     const server = await device.gatt.connect();
     const svc = await server.getPrimaryService(NUS_SVC);
     const tx = await svc.getCharacteristic(NUS_TX);
     const rx = await svc.getCharacteristic(NUS_RX);
-    let buf=''; const dec = new TextDecoder('utf-8');
-    tx.addEventListener('characteristicvaluechanged', ev=>{
-      buf += dec.decode(ev.target.value, {stream:true});
-      let i; while((i=buf.indexOf('\n'))>=0){ const l=buf.slice(0,i).replace(/\r$/,''); buf=buf.slice(i+1); if(l.length) onLine(l); }
-    });
+    const dec = new TextDecoder('latin1');   // protocol is ASCII; latin1 keeps 1 byte = 1 char so block byte counts are exact
+    tx.addEventListener('characteristicvaluechanged', ev=>{ rxFeed(dec.decode(ev.target.value)); });
     await tx.startNotifications();
     const enc = new TextEncoder();
     link = { sim:false, device, id:device.id,
       // QA 5: write WITH response in <=20-byte pieces so an MTU-23 Android stack can never truncate a note
       send: async (line)=>{ const data=enc.encode(line+'\n'); for(let i=0;i<data.length;i+=20){ await rx.writeValue(data.slice(i,i+20)); } },
       close: ()=>{ try{ device.gatt.disconnect(); }catch(e){} },
-      resetBuf: ()=>{ buf=''; } };   // A10-1: a lost trailing newline leaves half a line here; drop it before each L
+      resetBuf: ()=>{ rxReset(); } };   // A10-1: a lost trailing newline leaves half a line here; drop it before each L
     lastDevice=device; store('pp_device', { id:device.id, name:device.name||'PillPuck', at:Date.now() }); try{ localStorage.removeItem('pp_forgot'); }catch(e){}   // remembered puck (build 2)
     $('btn-ble').textContent='Disconnect';
     updateButtons(); con('sys','connected to '+(device.name||'puck')+' — asking for status');
@@ -720,9 +805,9 @@ async function connectBle(device){
     }, 1800);
   }catch(e){ con('sys','connect failed: '+e.message); toast('Connect failed: '+e.message); setDisc('idle','NO PUCK', lastDevice?'tap Reconnect':'tap Find my puck'); try{ device.gatt.disconnect(); }catch(_){} link=null; $('btn-ble').textContent = lastDevice?'Reconnect':'Find my puck'; $('btn-ble').disabled=false; updateButtons(); }
 }
-function onDisconnected(){ link=null; inLog=false; pulling=false; logSwallow=0; pullRefused=null; logBuf=[]; clearTimeout(logTimer); pullBest=null; $('log-progress').hidden=true; liveAlarm=false; updateButtons(); setDisc('idle','NO PUCK','disconnected'); $('btn-ble').textContent= lastDevice?'Reconnect':'Find my puck'; con('sys','disconnected'); renderLast(); }
+function onDisconnected(){ link=null; inLog=false; pulling=false; blk=null; blockFail=null; rxReset(); logSwallow=0; pullRefused=null; logBuf=[]; clearTimeout(logTimer); pullBest=null; $('log-progress').hidden=true; liveAlarm=false; updateButtons(); setDisc('idle','NO PUCK','disconnected'); $('btn-ble').textContent= lastDevice?'Reconnect':'Find my puck'; con('sys','disconnected'); renderLast(); }
 async function pullLog(){ if(inLog || pulling) { toast('Already pulling'); return; } pullAttempt=0; pullBest=null; await pullOnce(); }
-async function pullOnce(){ pullAttempt++; pulling=true; pullRefused=null; logBuf=[]; inLog=false; logBytes=0; logAnnounced=0; $('log-warn').hidden=true; $('btn-log').disabled=true; if(link && link.resetBuf) link.resetBuf(); const l=link; await send('L'); if(link!==l) return; armLogTimer(REPLY_MS); }
+async function pullOnce(){ pullAttempt++; pulling=true; pullRefused=null; blk=null; blockFail=null; blockExact=false; rxCount=0; logBuf=[]; inLog=false; logBytes=0; logAnnounced=0; $('log-warn').hidden=true; $('btn-log').disabled=true; if(link && link.resetBuf) link.resetBuf(); const l=link; await send('L 0'); if(link!==l) return; armLogTimer(REPLY_MS); }   // 'L 0': block mode on v0.7.1b+, plain dump on older firmware
 
 // ================= demo puck (simulator of the v0.7 text protocol) =================
 function makeSim(){
